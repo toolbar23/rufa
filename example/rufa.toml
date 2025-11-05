@@ -1,0 +1,53 @@
+[debug-update]
+prefix = "RUFA"
+update.vscode = ".vscode/launch.json"
+update.zed = ".zed/debug.json"
+
+[log]
+file = "rufa.log"
+rotation_after_seconds = 86400
+rotation_after_size_mb = 10
+keep_history_count = 5
+
+[restart]
+type = "BACKOFF"
+
+[env]
+read_env_file = ".env"
+
+[watch]
+stability_seconds = 10
+
+[target.FRONT_BACK]
+type = "composite"
+targets = "PRG1, PRG2"
+
+[target.PRG1]
+type = "java-spring-boot"
+kind = "service"
+module = "panda-core"
+# Only restart when these paths change; defaults to entire workspace.
+watch = ["modules/panda-core/src", "modules/shared"]
+watch_type = "RUFA"
+port.http.type = "http"
+port.http.auto_range = "8000-8100"
+port.debug.type = "tcp"
+port.debug.auto = true
+env.ADD_THIS_ENVVAR = "something"
+env.ADD_A_REFERENCE_TO_ANOTHER_TARGETS_PORT = "{PRG2:port.http}"
+env.ADD_WHATEVER_TO_ENV = "something else"
+
+[target.PRG2]
+type = "bun"
+kind = "job"
+timeout_seconds = 300
+script = "bun run report.ts"
+port.debug.type = "tcp"
+port.debug.auto = true
+port.metrics.type = "tcp"
+port.metrics.fixed = 9100
+
+[target.CLEANUP]
+type = "bash"
+kind = "job"
+command = "./scripts/cleanup.sh"
