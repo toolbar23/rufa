@@ -1,6 +1,7 @@
 mod cli;
 mod config;
 mod debug_update;
+mod env;
 mod ipc;
 mod logging;
 mod runner;
@@ -9,13 +10,13 @@ mod watch;
 
 use anyhow::Result;
 use clap::Parser;
-use std::env;
+use std::env as std_env;
 use std::ffi::OsString;
 
 #[tokio::main]
 async fn main() -> Result<()> {
     logging::init_tracing();
-    let mut args = env::args_os().collect::<Vec<_>>();
+    let mut args = std_env::args_os().collect::<Vec<_>>();
     if should_default_to_info(&args) {
         args.insert(1, OsString::from("info"));
     }

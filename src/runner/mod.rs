@@ -2,10 +2,13 @@
 
 //! Runtime process launcher and supervisor.
 
+mod drivers;
+mod ports;
+mod restart;
+
 use std::{
     collections::{HashMap, HashSet},
-    fs, io,
-    net::{IpAddr, Ipv4Addr, SocketAddr, TcpListener},
+    fs,
     path::{Path, PathBuf},
     sync::Arc,
     sync::atomic::{AtomicBool, Ordering},
@@ -18,24 +21,29 @@ use nix::{
     sys::signal::{Signal, kill as send_unix_signal},
     unistd::Pid,
 };
+use once_cell::sync::Lazy;
+use regex::Regex;
 use tokio::{
     io::{AsyncBufReadExt, BufReader},
-    net::TcpListener as TokioTcpListener,
     process::Command,
     sync::{Mutex, Notify, RwLock, mpsc},
-    task::{JoinHandle, yield_now},
     time::{sleep, timeout},
 };
 
 use crate::{
     config::{
-        self, Config, EnvValue, ReferenceResource, RestartConfig, RestartStrategy, Target,
-        TargetBehavior, TargetName, UnitTarget, WatchPreference,
+        self, Config, EnvValue, ReferenceResource, RestartConfig, Target, TargetBehavior,
+        TargetName, UnitTarget, WatchPreference,
     },
     debug_update::DebugUpdateContext,
+    env,
     logging::{EventLogger, LogEvent, LogStream},
     state::{ExitStatus, RuntimeState, TargetState},
 };
+
+use drivers::resolve_command;
+use ports::{PortAllocator, PortSentrySet, restore_port_sentries};
+use restart::{RestartCoordinator, RestartJob, RestartSchedule, update_runtime_restart_state};
 
 #[derive(Debug)]
 pub struct Runner {
@@ -45,12 +53,10 @@ pub struct Runner {
     port_allocator: Arc<Mutex<PortAllocator>>,
     processes: Arc<RwLock<HashMap<String, Arc<ProcessHandle>>>>,
     port_sentries: Arc<RwLock<HashMap<String, PortSentrySet>>>,
-    restart_config: RestartConfig,
-    restart_state: Arc<Mutex<HashMap<String, BackoffStatus>>>,
-    restart_suppressed: Arc<Mutex<HashSet<String>>>,
-    restart_tx: mpsc::Sender<RestartJob>,
+    restart: Arc<RestartCoordinator>,
     restart_rx: Mutex<mpsc::Receiver<RestartJob>>,
     history_keep: usize,
+    env_override_path: Option<PathBuf>,
 }
 
 #[derive(Debug, Default, Clone)]
@@ -71,8 +77,17 @@ impl Runner {
         state: Arc<RwLock<RuntimeState>>,
         restart_config: RestartConfig,
         history_keep: usize,
+        env_override_path: Option<PathBuf>,
     ) -> Self {
         let (restart_tx, restart_rx) = mpsc::channel(32);
+        let restart_state = Arc::new(Mutex::new(HashMap::new()));
+        let restart_suppressed = Arc::new(Mutex::new(HashSet::new()));
+        let restart = Arc::new(RestartCoordinator::new(
+            restart_config.strategy,
+            restart_state,
+            restart_suppressed,
+            restart_tx.clone(),
+        ));
         Self {
             config_path: config_path.into(),
             logger,
@@ -80,12 +95,10 @@ impl Runner {
             port_allocator: Arc::new(Mutex::new(PortAllocator::default())),
             processes: Arc::new(RwLock::new(HashMap::new())),
             port_sentries: Arc::new(RwLock::new(HashMap::new())),
-            restart_config,
-            restart_state: Arc::new(Mutex::new(HashMap::new())),
-            restart_suppressed: Arc::new(Mutex::new(HashSet::new())),
-            restart_tx,
+            restart,
             restart_rx: Mutex::new(restart_rx),
             history_keep: history_keep.max(1),
+            env_override_path,
         }
     }
 
@@ -150,15 +163,7 @@ impl Runner {
         target: &str,
         attempt_override: Option<u32>,
     ) -> Result<RestartSchedule, ()> {
-        let outcome = schedule_restart_core(
-            self.restart_config.strategy,
-            target,
-            attempt_override,
-            &self.restart_state,
-            &self.restart_suppressed,
-            &self.restart_tx,
-        )
-        .await?;
+        let outcome = self.restart.schedule(target, attempt_override).await?;
 
         match outcome {
             RestartSchedule::Scheduled { attempt, delay } => {
@@ -183,25 +188,25 @@ impl Runner {
     }
 
     async fn clear_pending_flag(&self, target: &str) {
-        clear_pending_flag_shared(&self.restart_state, target).await;
+        self.restart.clear_pending(target).await;
     }
 
     async fn reset_backoff_state(&self, target: &str) {
-        reset_backoff_state_shared(&self.restart_state, target).await;
+        self.restart.reset_backoff(target).await;
     }
 
     async fn consume_suppression(&self, target: &str) -> bool {
-        consume_suppression_shared(&self.restart_suppressed, target).await
+        self.restart.consume_suppression(target).await
     }
 
     async fn mark_restart_suppressed(&self, target: &str) {
-        mark_suppressed_shared(&self.restart_suppressed, target).await;
+        self.restart.mark_suppressed(target).await;
     }
 
     async fn on_target_launched(&self, target: &str, behavior: &TargetBehavior) {
-        let _ = consume_suppression_shared(&self.restart_suppressed, target).await;
+        let _ = self.restart.consume_suppression(target).await;
         if matches!(behavior, TargetBehavior::Service) {
-            reset_backoff_state_shared(&self.restart_state, target).await;
+            self.restart.reset_backoff(target).await;
             update_runtime_restart_state(&self.state, target, false, 0, None, None).await;
         }
     }
@@ -214,6 +219,10 @@ impl Runner {
             )
         })?;
 
+        self.watch_spec_from_config(&config, targets)
+    }
+
+    fn watch_spec_from_config(&self, config: &Config, targets: &[String]) -> Result<WatchSpec> {
         let base = self
             .config_path
             .parent()
@@ -221,7 +230,7 @@ impl Runner {
             .unwrap_or_else(|| PathBuf::from("."));
         let base = fs::canonicalize(&base).unwrap_or(base);
 
-        let units = resolve_units(&config, targets)?;
+        let units = resolve_units(config, targets)?;
         let mut map = HashMap::new();
         for unit in units {
             if matches!(unit.behavior, TargetBehavior::Service) {
@@ -263,6 +272,15 @@ impl Runner {
             bail!("no runnable targets resolved from selection");
         }
 
+        self.launch_units(&config, units, watch).await
+    }
+
+    async fn launch_units(
+        &self,
+        config: &Config,
+        units: Vec<UnitTarget>,
+        watch: bool,
+    ) -> Result<LaunchOutcome> {
         {
             let processes = self.processes.read().await;
             for unit in &units {
@@ -280,26 +298,41 @@ impl Runner {
             ))
         });
 
-        let env_file_vars = match config.env.read_env_file.as_ref() {
-            Some(path) => {
-                if !path.exists() {
-                    tracing::warn!(
-                        path = %path.display(),
-                        "environment file not found; continuing without overrides"
-                    );
-                    HashMap::new()
-                } else {
-                    match load_env_overrides(path) {
-                        Ok(vars) => vars,
-                        Err(error) => {
-                            tracing::warn!(%error, "failed to load environment overrides");
-                            HashMap::new()
-                        }
+        let mut env_file_vars = HashMap::new();
+        if let Some(path) = config.env.read_env_file.as_ref() {
+            if !path.exists() {
+                tracing::warn!(
+                    path = %path.display(),
+                    "environment file not found; continuing without overrides"
+                );
+            } else {
+                match env::load_env_overrides(path) {
+                    Ok(vars) => env_file_vars.extend(vars),
+                    Err(error) => {
+                        tracing::warn!(%error, "failed to load environment overrides");
                     }
                 }
             }
-            None => HashMap::new(),
-        };
+        }
+        if let Some(path) = self.env_override_path.as_ref() {
+            if !path.exists() {
+                tracing::warn!(
+                    path = %path.display(),
+                    "runtime env override file not found; continuing without overrides"
+                );
+            } else {
+                match env::load_env_overrides(path) {
+                    Ok(vars) => env_file_vars.extend(vars),
+                    Err(error) => {
+                        tracing::warn!(
+                            %error,
+                            path = %path.display(),
+                            "failed to load runtime environment overrides"
+                        );
+                    }
+                }
+            }
+        }
 
         let assignments = self.allocate_ports(&units).await?;
         let state_snapshot = {
@@ -319,18 +352,27 @@ impl Runner {
                 .unwrap_or(1);
 
             let previous = state_snapshot.targets.get(&unit.name);
-            let wants_runtime_watch = if watch {
-                matches!(
-                    unit.watch_preference,
-                    WatchPreference::PreferRuntimeSupplied
-                )
+            let runtime_watch_allowed = matches!(unit.behavior, TargetBehavior::Service);
+            let wants_runtime_watch = if runtime_watch_allowed {
+                if watch {
+                    matches!(
+                        unit.watch_preference,
+                        WatchPreference::PreferRuntimeSupplied
+                    )
+                } else {
+                    previous.map(|state| state.runtime_watch).unwrap_or(false)
+                }
             } else {
-                previous.map(|state| state.runtime_watch).unwrap_or(false)
+                false
             };
-            let wants_rufa_watch = if watch {
-                matches!(unit.watch_preference, WatchPreference::Rufa)
+            let wants_rufa_watch = if matches!(unit.behavior, TargetBehavior::Service) {
+                if watch {
+                    matches!(unit.watch_preference, WatchPreference::Rufa)
+                } else {
+                    previous.map(|state| state.rufa_watch).unwrap_or(false)
+                }
             } else {
-                previous.map(|state| state.rufa_watch).unwrap_or(false)
+                false
             };
             if wants_rufa_watch {
                 rufa_watch_targets.push(unit.name.clone());
@@ -385,7 +427,7 @@ impl Runner {
         let rufa_watch = if rufa_watch_targets.is_empty() {
             None
         } else {
-            Some(self.watch_spec(&rufa_watch_targets).await?)
+            Some(self.watch_spec_from_config(config, &rufa_watch_targets)?)
         };
 
         Ok(LaunchOutcome { rufa_watch })
@@ -530,10 +572,7 @@ impl Runner {
         let state = self.state.clone();
         let allocator = self.port_allocator.clone();
         let processes = self.processes.clone();
-        let restart_state = self.restart_state.clone();
-        let restart_suppressed = self.restart_suppressed.clone();
-        let restart_tx = self.restart_tx.clone();
-        let restart_strategy = self.restart_config.strategy;
+        let restart = self.restart.clone();
         let timeout = match &behavior {
             TargetBehavior::Job { timeout } => *timeout,
             TargetBehavior::Service => None,
@@ -603,16 +642,7 @@ impl Runner {
 
             if matches!(behavior, TargetBehavior::Service) {
                 if should_restart {
-                    match schedule_restart_core(
-                        restart_strategy,
-                        &target_name,
-                        None,
-                        &restart_state,
-                        &restart_suppressed,
-                        &restart_tx,
-                    )
-                    .await
-                    {
+                    match restart.schedule(&target_name, None).await {
                         Ok(RestartSchedule::Scheduled { attempt, delay }) => {
                             let scheduled_for = SystemTime::now().checked_add(delay);
                             update_runtime_restart_state(
@@ -650,12 +680,12 @@ impl Runner {
                         }
                     }
                 } else {
-                    reset_backoff_state_shared(&restart_state, &target_name).await;
+                    restart.reset_backoff(&target_name).await;
                     update_runtime_restart_state(&state, &target_name, false, 0, None, None).await;
                 }
             }
 
-            if let Err(error) = restore_port_sentries(
+            if let Err(error) = ports::restore_port_sentries(
                 port_sentries.clone(),
                 target_name.clone(),
                 ports_for_wait.clone(),
@@ -756,7 +786,7 @@ impl Runner {
             self.terminate_target(unit).await?;
         }
 
-        self.launch_targets(&unit_names, watch_requested).await
+        self.launch_units(&config, units, watch_requested).await
     }
 
     pub async fn stop_all(&self) -> Result<()> {
@@ -899,7 +929,15 @@ fn build_environment(
     env.insert("RUFA_TARGET".to_string(), unit.name.clone());
     env.insert("RUFA_GENERATION".to_string(), generation.to_string());
 
-    Ok(env)
+    let interpolated = env
+        .into_iter()
+        .map(|(key, value)| {
+            let rendered = interpolate_placeholders(&value, assignments, state)?;
+            Ok((key, rendered))
+        })
+        .collect::<Result<HashMap<_, _>>>()?;
+
+    Ok(interpolated)
 }
 
 fn resolve_reference(
@@ -930,233 +968,86 @@ fn resolve_reference(
     }
 }
 
-fn resolve_command(unit: &UnitTarget, runtime_watch: bool) -> Result<String> {
-    match unit.driver_type.to_ascii_lowercase().as_str() {
-        "java-spring-boot" => resolve_java_spring_boot_command(unit, runtime_watch),
-        "bun" => resolve_bun_command(unit, runtime_watch),
-        "bash" => resolve_script_property(unit, "command"),
-        _ => resolve_generic_command(unit),
-    }
-}
+fn interpolate_placeholders(
+    input: &str,
+    assignments: &HashMap<String, HashMap<String, u16>>,
+    state: &RuntimeState,
+) -> Result<String> {
+    static PLACEHOLDER: Lazy<Regex> = Lazy::new(|| {
+        Regex::new(r"\$\{([A-Za-z0-9_.:-]+)\}|\{([A-Za-z0-9_.:-]+)\}")
+            .expect("valid placeholder regex")
+    });
 
-fn resolve_java_spring_boot_command(unit: &UnitTarget, runtime_watch: bool) -> Result<String> {
-    if let Some(command) = unit
-        .properties
-        .get("command")
-        .and_then(|value| value.as_str())
-    {
-        return Ok(
-            adjust_runtime_watch_flag(command, runtime_watch, " --spring-boot-devtools")
-                .to_string(),
-        );
-    }
-
-    if let Some(module) = unit
-        .properties
-        .get("module")
-        .and_then(|value| value.as_str())
-    {
-        // Default to Maven Spring Boot plugin.
-        let mut jvm_args =
-            "-agentlib:jdwp=transport=dt_socket,server=y,suspend=n,address=*:${PORT_DEBUG}"
-                .to_string();
-        if runtime_watch {
-            jvm_args.push(' ');
-            jvm_args.push_str("-Dspring.devtools.restart.enabled=true");
+    let mut rendered = String::with_capacity(input.len());
+    let mut last = 0usize;
+    for captures in PLACEHOLDER.captures_iter(input) {
+        let m = captures.get(0).expect("match present");
+        rendered.push_str(&input[last..m.start()]);
+        let spec = captures
+            .get(1)
+            .or_else(|| captures.get(2))
+            .unwrap()
+            .as_str();
+        if let Some(value) = resolve_port_placeholder(spec, assignments, state)? {
+            rendered.push_str(&value);
+        } else {
+            rendered.push_str(m.as_str());
         }
-        let command = format!(
-            "mvn -pl {module} spring-boot:run -Dspring-boot.run.jvmArguments=\"{args}\"",
-            module = module,
-            args = jvm_args
-        );
-        return Ok(command);
+        last = m.end();
     }
-
-    if let Some(jar) = unit.properties.get("jar").and_then(|value| value.as_str()) {
-        return Ok(format!("java -jar {}", jar));
-    }
-
-    bail!(
-        "target {} (java-spring-boot) must define `command`, `module`, or `jar` property",
-        unit.name
-    );
+    rendered.push_str(&input[last..]);
+    Ok(rendered)
 }
 
-fn resolve_script_property(unit: &UnitTarget, key: &str) -> Result<String> {
-    unit.properties
-        .get(key)
-        .and_then(|value| value.as_str())
-        .map(|value| value.to_string())
-        .ok_or_else(|| {
-            anyhow!(
-                "target {} requires `{}` property in configuration",
-                unit.name,
-                key
-            )
-        })
-}
+fn resolve_port_placeholder(
+    spec: &str,
+    assignments: &HashMap<String, HashMap<String, u16>>,
+    state: &RuntimeState,
+) -> Result<Option<String>> {
+    let Some((target, remainder)) = spec.split_once(':') else {
+        return Ok(None);
+    };
 
-fn resolve_generic_command(unit: &UnitTarget) -> Result<String> {
-    if let Some(command) = unit
-        .properties
-        .get("command")
-        .and_then(|value| value.as_str())
-    {
-        return Ok(command.to_string());
-    }
-
-    if let Some(script) = unit
-        .properties
-        .get("script")
-        .and_then(|value| value.as_str())
-    {
-        return Ok(script.to_string());
-    }
-
-    bail!(
-        "target {} is missing a `command` or `script` property",
-        unit.name
-    );
-}
-
-fn resolve_bun_command(unit: &UnitTarget, runtime_watch: bool) -> Result<String> {
-    let command = resolve_script_property(unit, "script")?;
-    if runtime_watch && !command.contains("--watch") {
-        Ok(format!("{command} --watch"))
-    } else {
-        Ok(command)
-    }
-}
-
-fn adjust_runtime_watch_flag(command: &str, runtime_watch: bool, flag: &str) -> String {
-    if runtime_watch && !command.contains(flag.trim()) {
-        format!("{command}{flag}")
-    } else {
-        command.to_string()
-    }
-}
-
-#[derive(Debug, Clone, Copy)]
-enum RestartSchedule {
-    Scheduled { attempt: u32, delay: Duration },
-    AlreadyPending,
-    Skipped,
-}
-
-async fn schedule_restart_core(
-    strategy: RestartStrategy,
-    target: &str,
-    attempt_override: Option<u32>,
-    restart_state: &Arc<Mutex<HashMap<String, BackoffStatus>>>,
-    restart_suppressed: &Arc<Mutex<HashSet<String>>>,
-    restart_tx: &mpsc::Sender<RestartJob>,
-) -> Result<RestartSchedule, ()> {
-    if !matches!(strategy, RestartStrategy::Backoff) {
-        return Ok(RestartSchedule::Skipped);
-    }
-
-    if consume_suppression_shared(restart_suppressed, target).await {
-        reset_backoff_state_shared(restart_state, target).await;
-        return Ok(RestartSchedule::Skipped);
-    }
-
-    let mut statuses = restart_state.lock().await;
-    let status = statuses.entry(target.to_string()).or_default();
-    if status.pending {
-        if let Some(value) = attempt_override {
-            if value > status.attempt {
-                status.attempt = value;
-            }
-        }
-        return Ok(RestartSchedule::AlreadyPending);
-    }
-    let next_attempt = attempt_override.unwrap_or_else(|| status.attempt.saturating_add(1).max(1));
-    status.attempt = next_attempt;
-    status.pending = true;
-    drop(statuses);
-
-    let delay = compute_backoff_delay(next_attempt);
-    tracing::warn!(
-        target,
-        attempt = next_attempt,
-        delay_secs = delay.as_secs_f64(),
-        "scheduling service restart with backoff"
-    );
-    if let Err(error) = restart_tx
-        .send(RestartJob {
+    if let Some(port_name) = remainder.strip_prefix("port.") {
+        let reference = crate::config::model::EnvReference {
             target: target.to_string(),
-            attempt: next_attempt,
-            delay,
-        })
-        .await
-    {
-        tracing::error!(%error, target, "failed to enqueue restart job");
-        let mut statuses = restart_state.lock().await;
-        if let Some(entry) = statuses.get_mut(target) {
-            entry.pending = false;
-        }
-        return Err(());
+            resource: ReferenceResource::Port {
+                name: port_name.to_string(),
+            },
+        };
+        return resolve_reference(&reference, assignments, state)
+            .map(Some)
+            .or_else(|_| Ok(None));
     }
 
-    Ok(RestartSchedule::Scheduled {
-        attempt: next_attempt,
-        delay,
-    })
+    Ok(None)
 }
 
-async fn clear_pending_flag_shared(
-    restart_state: &Arc<Mutex<HashMap<String, BackoffStatus>>>,
-    target: &str,
-) {
-    let mut statuses = restart_state.lock().await;
-    if let Some(status) = statuses.get_mut(target) {
-        status.pending = false;
-    }
-}
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-async fn reset_backoff_state_shared(
-    restart_state: &Arc<Mutex<HashMap<String, BackoffStatus>>>,
-    target: &str,
-) {
-    let mut statuses = restart_state.lock().await;
-    let entry = statuses.entry(target.to_string()).or_default();
-    entry.attempt = 0;
-    entry.pending = false;
-}
+    #[test]
+    fn interpolates_port_placeholders_in_env_values() -> Result<()> {
+        let mut assignments: HashMap<String, HashMap<String, u16>> = HashMap::new();
+        assignments.insert(
+            "infra".to_string(),
+            HashMap::from([("mysql".to_string(), 3307), ("mq".to_string(), 5673)]),
+        );
 
-async fn consume_suppression_shared(
-    restart_suppressed: &Arc<Mutex<HashSet<String>>>,
-    target: &str,
-) -> bool {
-    let mut suppressed = restart_suppressed.lock().await;
-    suppressed.remove(target)
-}
+        let mut state = RuntimeState::default();
+        state
+            .targets
+            .entry("infra".to_string())
+            .or_default()
+            .ports
+            .insert("analytics".to_string(), 9999);
 
-async fn mark_suppressed_shared(restart_suppressed: &Arc<Mutex<HashSet<String>>>, target: &str) {
-    let mut suppressed = restart_suppressed.lock().await;
-    suppressed.insert(target.to_string());
-}
+        let value = "mysql://127.0.0.1:${infra:port.mysql}?alt={infra:port.analytics}";
+        let rendered = interpolate_placeholders(value, &assignments, &state)?;
+        assert_eq!(rendered, "mysql://127.0.0.1:3307?alt=9999");
 
-fn compute_backoff_delay(attempt: u32) -> Duration {
-    let clamped = attempt.max(1).min(8);
-    let seconds = 1u64 << (clamped - 1);
-    Duration::from_secs(seconds.min(60))
-}
-
-async fn update_runtime_restart_state(
-    state: &Arc<RwLock<RuntimeState>>,
-    target: &str,
-    pending: bool,
-    attempt: u32,
-    delay: Option<Duration>,
-    scheduled_for: Option<SystemTime>,
-) {
-    let mut guard = state.write().await;
-    if let Some(entry) = guard.targets.get_mut(target) {
-        entry.restart_pending = pending;
-        entry.restart_attempt = attempt;
-        entry.restart_delay = delay;
-        entry.restart_scheduled_for = scheduled_for;
+        Ok(())
     }
 }
 
@@ -1201,257 +1092,6 @@ impl ProcessHandle {
     }
 }
 
-#[derive(Debug, Default)]
-struct BackoffStatus {
-    attempt: u32,
-    pending: bool,
-}
-
-#[derive(Debug)]
-struct RestartJob {
-    target: String,
-    attempt: u32,
-    delay: Duration,
-}
-
-#[derive(Debug)]
-struct PortSentry {
-    port: u16,
-    shutdown: tokio::sync::watch::Sender<bool>,
-    handle: JoinHandle<()>,
-}
-
-impl PortSentry {
-    async fn bind(port: u16) -> io::Result<Self> {
-        let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), port);
-        let listener = TokioTcpListener::bind(addr).await?;
-        let (shutdown_tx, mut shutdown_rx) = tokio::sync::watch::channel(false);
-        let handle = tokio::spawn(async move {
-            let mut shutdown_rx_inner = shutdown_rx.clone();
-            loop {
-                tokio::select! {
-                    changed = shutdown_rx.changed() => {
-                        if changed.is_ok() && *shutdown_rx.borrow() {
-                            break;
-                        }
-                        let _ = shutdown_rx.borrow_and_update();
-                    }
-                    result = listener.accept() => {
-                        match result {
-                            Ok((stream, _)) => {
-                                let hold = sleep(Duration::from_millis(100));
-                                tokio::pin!(hold);
-                                tokio::select! {
-                                    _ = &mut hold => {}
-                                    changed = shutdown_rx_inner.changed() => {
-                                        if changed.is_ok() && *shutdown_rx_inner.borrow() {
-                                            return;
-                                        }
-                                        let _ = shutdown_rx_inner.borrow_and_update();
-                                        continue;
-                                    }
-                                }
-                                drop(stream);
-                            }
-                            Err(err) => {
-                                if err.kind() == io::ErrorKind::Interrupted {
-                                    continue;
-                                }
-                                if err.kind() == io::ErrorKind::WouldBlock {
-                                    yield_now().await;
-                                    continue;
-                                }
-                                tracing::debug!(%err, port, "port sentinel accept error");
-                                sleep(Duration::from_millis(50)).await;
-                            }
-                        }
-                    }
-                }
-            }
-        });
-        Ok(Self {
-            port,
-            shutdown: shutdown_tx,
-            handle,
-        })
-    }
-
-    async fn stop(self) {
-        let _ = self.shutdown.send(true);
-        let _ = self.handle.await;
-    }
-}
-
-#[derive(Debug)]
-struct PortSentrySet {
-    sentries: Vec<PortSentry>,
-}
-
-impl PortSentrySet {
-    async fn bind_from_ports(ports: &HashMap<String, u16>) -> io::Result<Self> {
-        let mut seen = HashSet::new();
-        let mut sentries = Vec::new();
-        for port in ports.values().copied() {
-            if seen.insert(port) {
-                sentries.push(PortSentry::bind(port).await?);
-            }
-        }
-        Ok(Self { sentries })
-    }
-
-    async fn stop(self) {
-        for sentry in self.sentries {
-            sentry.stop().await;
-        }
-    }
-}
-
-#[derive(Debug, Default)]
-struct PortAllocator {
-    reserved: HashSet<u16>,
-}
-
-impl PortAllocator {
-    fn allocate(&mut self, selection: crate::config::model::PortSelection) -> Result<u16> {
-        match selection {
-            crate::config::model::PortSelection::Auto => self.allocate_ephemeral(),
-            crate::config::model::PortSelection::AutoRange { start, end } => {
-                self.allocate_from_range(start, end)
-            }
-            crate::config::model::PortSelection::Fixed(port) => {
-                self.allocate_fixed(port)?;
-                Ok(port)
-            }
-        }
-    }
-
-    fn allocate_ephemeral(&mut self) -> Result<u16> {
-        let listener = TcpListener::bind(("127.0.0.1", 0))
-            .context("binding to ephemeral port for allocation")?;
-        let port = listener.local_addr()?.port();
-        drop(listener);
-        if self.reserved.insert(port) {
-            Ok(port)
-        } else {
-            self.allocate_ephemeral()
-        }
-    }
-
-    fn allocate_from_range(&mut self, start: u16, end: u16) -> Result<u16> {
-        for port in start..=end {
-            if self.reserved.contains(&port) {
-                continue;
-            }
-            if TcpListener::bind(("127.0.0.1", port)).is_ok() {
-                self.reserved.insert(port);
-                return Ok(port);
-            }
-        }
-        bail!("no free ports in range {start}-{end}");
-    }
-
-    fn allocate_fixed(&mut self, port: u16) -> Result<()> {
-        if self.reserved.contains(&port) {
-            bail!("port {port} is already reserved");
-        }
-
-        TcpListener::bind(("127.0.0.1", port))
-            .map(|listener| drop(listener))
-            .with_context(|| format!("port {port} is not available"))?;
-        self.reserved.insert(port);
-        Ok(())
-    }
-
-    fn release_ports<I>(&mut self, ports: I)
-    where
-        I: Iterator<Item = u16>,
-    {
-        for port in ports {
-            self.reserved.remove(&port);
-        }
-    }
-}
-
-async fn restore_port_sentries(
-    store: Arc<RwLock<HashMap<String, PortSentrySet>>>,
-    target: String,
-    ports: HashMap<String, u16>,
-) -> Result<()> {
-    let sentries = PortSentrySet::bind_from_ports(&ports)
-        .await
-        .with_context(|| format!("binding placeholder listeners for target {}", target))?;
-    let previous = {
-        let mut map = store.write().await;
-        map.insert(target.clone(), sentries)
-    };
-    if let Some(prev) = previous {
-        prev.stop().await;
-    }
-    Ok(())
-}
-
-pub(crate) fn load_env_overrides(path: &Path) -> Result<HashMap<String, String>> {
-    parse_lenient_dotenv(path).map_err(|error| {
-        anyhow!(
-            "failed to parse environment overrides from {:?}: {error}",
-            path
-        )
-    })
-}
-
-fn parse_lenient_dotenv(path: &Path) -> io::Result<HashMap<String, String>> {
-    let mut map = HashMap::new();
-    let contents = fs::read_to_string(path)?;
-
-    for (idx, raw) in contents.lines().enumerate() {
-        let mut line = raw.trim();
-        if line.is_empty() || line.starts_with('#') {
-            continue;
-        }
-
-        line = line.strip_prefix("export ").unwrap_or(line).trim();
-        if line.is_empty() || line.starts_with('#') {
-            continue;
-        }
-
-        let Some(eq_index) = line.find('=') else {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!("no '=' on line {}", idx + 1),
-            ));
-        };
-
-        let (key_part, value_part_with_eq) = line.split_at(eq_index);
-        let key = key_part.trim();
-        if key.is_empty() {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!("empty key on line {}", idx + 1),
-            ));
-        }
-
-        let mut value = value_part_with_eq[1..].trim().to_string();
-        if value.len() >= 2
-            && ((value.starts_with('"') && value.ends_with('"'))
-                || (value.starts_with('\'') && value.ends_with('\'')))
-        {
-            value = value[1..value.len() - 1].to_string();
-            value = value
-                .replace(r"\n", "\n")
-                .replace(r"\t", "\t")
-                .replace(r"\\", "\\")
-                .replace(r#"\""#, "\"")
-                .replace(r"\'", "'");
-        } else if let Some(hash) = value.find('#') {
-            value = value[..hash].trim_end().to_string();
-        }
-
-        map.insert(key.to_string(), value);
-    }
-
-    Ok(map)
-}
-
 fn exit_message(status: &std::process::ExitStatus) -> String {
     if let Some(code) = status.code() {
         format!("exited with code {code}")
@@ -1473,52 +1113,5 @@ fn exit_signal(status: &std::process::ExitStatus) -> Option<i32> {
     {
         let _ = status;
         None
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::load_env_overrides;
-    use anyhow::Result;
-    use std::io::Write;
-    use tempfile::NamedTempFile;
-
-    #[test]
-    fn load_env_overrides_accepts_dot_names() -> Result<()> {
-        let mut file = NamedTempFile::new()?;
-        writeln!(file, "APP.CONFIG=value")?;
-        writeln!(file, "feature.flag=true")?;
-        writeln!(file, ".leading.dot=present")?;
-        writeln!(file, "service-name=web")?;
-        writeln!(file, "QUOTED=\"line\\nvalue\"")?;
-        writeln!(file, "WITH_COMMENT=value # trailing info")?;
-        file.flush()?;
-
-        let overrides = load_env_overrides(file.path())?;
-        assert_eq!(
-            overrides.get("APP.CONFIG").map(String::as_str),
-            Some("value")
-        );
-        assert_eq!(
-            overrides.get("feature.flag").map(String::as_str),
-            Some("true")
-        );
-        assert_eq!(
-            overrides.get(".leading.dot").map(String::as_str),
-            Some("present")
-        );
-        assert_eq!(
-            overrides.get("service-name").map(String::as_str),
-            Some("web")
-        );
-        assert_eq!(
-            overrides.get("QUOTED").map(String::as_str),
-            Some("line\nvalue")
-        );
-        assert_eq!(
-            overrides.get("WITH_COMMENT").map(String::as_str),
-            Some("value")
-        );
-        Ok(())
     }
 }

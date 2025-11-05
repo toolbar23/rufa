@@ -4,9 +4,9 @@ mod protocol;
 pub use lock::LockInfo;
 pub use protocol::{
     AvailableTargetSummary, BehaviorKind, ConfigureRequest, ExitDetails, InfoRequest, InfoResponse,
-    KillRequest, LogRequest, PortSummary, RestartRequest, RunHistorySummary, RunRequest,
-    RestartStatusSummary, RunningTargetSummary, ServerResponse, StoppedTargetSummary,
-    TargetConfigSummary, TargetRunState, WatchPreferenceKind,
+    KillRequest, LogRequest, PortSummary, RestartRequest, RestartStatusSummary, RunHistorySummary,
+    RunRequest, RunningTargetSummary, ServerResponse, StoppedTargetSummary, TargetConfigSummary,
+    TargetRunState, WatchPreferenceKind,
 };
 
 #[cfg(unix)]
@@ -50,7 +50,10 @@ mod unix {
         bail!("IPC is not supported on this platform")
     }
 
-    pub async fn spawn_daemon_process(_default_watch: bool) -> Result<()> {
+    pub async fn spawn_daemon_process(
+        _default_watch: bool,
+        _env_file: Option<&std::path::Path>,
+    ) -> Result<()> {
         bail!("IPC is not supported on this platform")
     }
 

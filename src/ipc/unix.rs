@@ -120,7 +120,7 @@ pub async fn require_daemon_client() -> Result<IpcClient> {
         .ok_or_else(|| anyhow!("rufa daemon is not running; launch it with `rufa start`"))
 }
 
-pub async fn spawn_daemon_process(default_watch: bool) -> Result<()> {
+pub async fn spawn_daemon_process(default_watch: bool, env_file: Option<&Path>) -> Result<()> {
     // Clean up any existing lock/socket artifacts before spawning.
     if let Some(lock_info) = lock::read_lock().ok().flatten() {
         let _ = cleanup_stale(&lock_info);
@@ -132,6 +132,14 @@ pub async fn spawn_daemon_process(default_watch: bool) -> Result<()> {
     let mut command = std::process::Command::new(current_exe);
     command.arg("__daemon");
     command.env("RUFA_DEFAULT_WATCH", if default_watch { "1" } else { "0" });
+    match env_file {
+        Some(path) => {
+            command.env(crate::env::OVERRIDE_ENV_FILE_VAR, path);
+        }
+        None => {
+            command.env_remove(crate::env::OVERRIDE_ENV_FILE_VAR);
+        }
+    }
     command.stdin(std::process::Stdio::null());
     command.stdout(std::process::Stdio::inherit());
     command.stderr(std::process::Stdio::inherit());
@@ -206,10 +214,12 @@ async fn run_daemon_internal() -> Result<()> {
     );
 
     let config_path = PathBuf::from("rufa.toml");
+    let env_override_path = std::env::var_os(crate::env::OVERRIDE_ENV_FILE_VAR).map(PathBuf::from);
     let watch = Arc::new(WatchManager::new());
     let default_watch_flag = Arc::new(AtomicBool::new(default_watch));
     let context = Arc::new(ServerContext {
-        runner: initialize_runner(&config_path).context("initializing runner")?,
+        runner: initialize_runner(&config_path, env_override_path)
+            .context("initializing runner")?,
         watch,
         default_watch: default_watch_flag,
     });
@@ -726,7 +736,10 @@ fn exit_details_from_state(exit: &ExitStatus) -> ExitDetails {
     }
 }
 
-fn initialize_runner(config_path: &Path) -> Result<Arc<Runner>> {
+fn initialize_runner(
+    config_path: &Path,
+    env_override_path: Option<PathBuf>,
+) -> Result<Arc<Runner>> {
     let (log_config, restart_config, history_keep) = match config::load_from_path(config_path) {
         Ok(cfg) => (cfg.log, cfg.restart, cfg.run_history.keep_runs),
         Err(error) => {
@@ -747,6 +760,7 @@ fn initialize_runner(config_path: &Path) -> Result<Arc<Runner>> {
         state,
         restart_config,
         history_keep,
+        env_override_path,
     ));
     runner.spawn_background_tasks();
     Ok(runner)
