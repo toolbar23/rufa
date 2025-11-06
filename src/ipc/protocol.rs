@@ -3,8 +3,8 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum ClientCommand {
     Ping,
-    Run(RunRequest),
-    Kill(KillRequest),
+    StartTargets(StartTargetsRequest),
+    StopTargets(StopTargetsRequest),
     Configure(ConfigureRequest),
     Info(InfoRequest),
     Log(LogRequest),
@@ -13,13 +13,12 @@ pub enum ClientCommand {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct RunRequest {
+pub struct StartTargetsRequest {
     pub targets: Vec<String>,
-    pub watch: Option<bool>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct KillRequest {
+pub struct StopTargetsRequest {
     pub targets: Vec<String>,
 }
 

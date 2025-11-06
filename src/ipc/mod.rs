@@ -4,9 +4,9 @@ mod protocol;
 pub use lock::{LockInfo, runtime_dir};
 pub use protocol::{
     AvailableTargetSummary, BehaviorKind, ConfigureRequest, ControlStateSummary, ExitDetails,
-    InfoRequest, InfoResponse, KillRequest, LogRequest, PortSummary, RestartRequest,
-    RunHistorySummary, RunRequest, RunningTargetSummary, ServerResponse, StoppedTargetSummary,
-    TargetConfigSummary, TargetRunState, WatchPreferenceKind,
+    InfoRequest, InfoResponse, LogRequest, PortSummary, RestartRequest, RunHistorySummary,
+    RunningTargetSummary, ServerResponse, StartTargetsRequest, StopTargetsRequest,
+    StoppedTargetSummary, TargetConfigSummary, TargetRunState, WatchPreferenceKind,
 };
 
 #[cfg(unix)]
@@ -25,7 +25,10 @@ mod unix {
     use anyhow::{Result, bail};
 
     use super::protocol::ClientCommand;
-    use super::{InfoRequest, LogRequest, RestartRequest, RunRequest, ServerResponse};
+    use super::{
+        InfoRequest, LogRequest, RestartRequest, ServerResponse, StartTargetsRequest,
+        StopTargetsRequest,
+    };
 
     #[derive(Debug, Clone)]
     pub struct IpcClient;
@@ -46,7 +49,7 @@ mod unix {
         bail!("IPC is not supported on this platform")
     }
 
-    pub async fn run_daemon_foreground(_request: RunRequest) -> Result<()> {
+    pub async fn run_daemon_foreground(_request: StartTargetsRequest) -> Result<()> {
         bail!("IPC is not supported on this platform")
     }
 
@@ -70,7 +73,11 @@ mod unix {
             bail!("IPC is not supported on this platform")
         }
 
-        pub async fn run(&self, _request: RunRequest) -> Result<ServerResponse> {
+        pub async fn start_targets(&self, _request: StartTargetsRequest) -> Result<ServerResponse> {
+            bail!("IPC is not supported on this platform")
+        }
+
+        pub async fn stop_targets(&self, _request: StopTargetsRequest) -> Result<ServerResponse> {
             bail!("IPC is not supported on this platform")
         }
 

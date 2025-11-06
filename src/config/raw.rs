@@ -8,8 +8,6 @@ pub struct RawConfig {
     #[serde(default)]
     pub log: RawLogConfig,
     #[serde(default)]
-    pub restart: RawRestartConfig,
-    #[serde(default)]
     pub env: Option<RawEnvConfig>,
     #[serde(default, rename = "debug-update")]
     pub debug_update: Option<RawDebugUpdateConfig>,
@@ -27,12 +25,6 @@ pub struct RawLogConfig {
     pub rotation_after_seconds: Option<u64>,
     pub rotation_after_size_mb: Option<u64>,
     pub keep_history_count: Option<usize>,
-}
-
-#[derive(Debug, Default, Deserialize)]
-pub struct RawRestartConfig {
-    #[serde(rename = "type")]
-    pub strategy: Option<String>,
 }
 
 #[derive(Debug, Default, Deserialize)]

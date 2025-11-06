@@ -10,7 +10,6 @@ pub type TargetName = String;
 #[derive(Debug, Clone)]
 pub struct Config {
     pub log: LogConfig,
-    pub restart: RestartConfig,
     pub env: EnvConfig,
     pub watch: WatchConfig,
     pub run_history: RunHistoryConfig,
@@ -33,25 +32,6 @@ impl Default for LogConfig {
             rotation_after: None,
             rotation_size_bytes: None,
             keep_history_count: 5,
-        }
-    }
-}
-
-#[derive(Debug, Clone)]
-pub struct RestartConfig {
-    pub strategy: RestartStrategy,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum RestartStrategy {
-    No,
-    Backoff,
-}
-
-impl Default for RestartConfig {
-    fn default() -> Self {
-        Self {
-            strategy: RestartStrategy::Backoff,
         }
     }
 }

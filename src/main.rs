@@ -41,14 +41,12 @@ fn should_default_to_info(args: &[OsString]) -> bool {
 
     let commands = [
         "start",
-        "run",
-        "kill",
+        "stop",
+        "target",
         "info",
         "log",
-        "restart",
-        "stop",
         "completions",
-        "daemon",
+        "init",
         "__daemon",
     ];
 

@@ -9,9 +9,8 @@ use super::{
     error::{ConfigError, ConfigResult},
     model::{
         CompositeTarget, Config, DebugUpdateConfig, EnvConfig, EnvReference, EnvValue, LogConfig,
-        PortDefinition, PortProtocol, PortSelection, ReferenceResource, RestartConfig,
-        RestartStrategy, RunHistoryConfig, Target, TargetBehavior, TargetName, UnitTarget,
-        WatchConfig, WatchPreference,
+        PortDefinition, PortProtocol, PortSelection, ReferenceResource, RunHistoryConfig, Target,
+        TargetBehavior, TargetName, UnitTarget, WatchConfig, WatchPreference,
     },
     raw::{RawConfig, RawRunHistoryConfig, RawTarget, RawWatchConfig},
 };
@@ -34,7 +33,6 @@ pub fn load_from_str(config_path: &Path, contents: &str) -> ConfigResult<Config>
 
 fn convert_raw_config(config_path: &Path, raw: RawConfig) -> ConfigResult<Config> {
     let log = convert_log_config(config_path, raw.log);
-    let restart = convert_restart_config(raw.restart)?;
     let env = convert_env_config(config_path, raw.env);
     let watch = convert_watch_config(raw.watch);
     let run_history = convert_run_history_config(raw.run_history);
@@ -43,7 +41,6 @@ fn convert_raw_config(config_path: &Path, raw: RawConfig) -> ConfigResult<Config
 
     Ok(Config {
         log,
-        restart,
         env,
         watch,
         run_history,
@@ -72,22 +69,6 @@ fn convert_log_config(config_path: &Path, raw: super::raw::RawLogConfig) -> LogC
         rotation_size_bytes,
         keep_history_count,
     }
-}
-
-fn convert_restart_config(raw: super::raw::RawRestartConfig) -> ConfigResult<RestartConfig> {
-    let strategy = match raw.strategy {
-        None => RestartStrategy::Backoff,
-        Some(value) => match value.to_ascii_uppercase().as_str() {
-            "BACKOFF" => RestartStrategy::Backoff,
-            "NO" => RestartStrategy::No,
-            other => {
-                return Err(ConfigError::UnknownRestartType {
-                    value: other.to_string(),
-                });
-            }
-        },
-    };
-    Ok(RestartConfig { strategy })
 }
 
 fn convert_env_config(config_path: &Path, raw: Option<super::raw::RawEnvConfig>) -> EnvConfig {
@@ -581,9 +562,6 @@ rotation_after_seconds = 86400
 rotation_after_size_mb = 10
 keep_history_count = 5
 
-[restart]
-type = "BACKOFF"
-
 [env]
 read_env_file = ".env"
 
@@ -622,7 +600,6 @@ port.metrics.fixed = 9100
         assert_eq!(config.log.rotation_after, Some(Duration::from_secs(86400)));
         assert_eq!(config.log.rotation_size_bytes, Some(10 * 1024 * 1024));
         assert_eq!(config.log.keep_history_count, 5);
-        assert_eq!(config.restart.strategy, RestartStrategy::Backoff);
         assert_eq!(config.watch.stability, Duration::from_secs(10));
         let debug_update = config.debug_update.as_ref().expect("debug update");
         assert_eq!(debug_update.prefix, "RUFA");

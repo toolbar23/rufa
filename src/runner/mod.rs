@@ -69,7 +69,7 @@ pub struct WatchSpec {
 }
 
 #[derive(Debug, Default)]
-pub struct LaunchOutcome {
+pub struct StartOutcome {
     pub rufa_watch: Option<WatchSpec>,
 }
 
@@ -293,10 +293,7 @@ impl Runner {
                         .map(|ctrl| ctrl.watch_request)
                         .unwrap_or(false)
                 };
-                match self
-                    .launch_targets(&[target.clone()], watch_requested)
-                    .await
-                {
+                match self.start_targets(&[target.clone()], watch_requested).await {
                     Ok(_) => {
                         self.replace_action_plan(&target, *on_success).await;
                     }
@@ -353,7 +350,7 @@ impl Runner {
         self.watch_spec_from_config(&config, targets)
     }
 
-    pub async fn request_run(&self, targets: &[String], watch: bool) -> Result<LaunchOutcome> {
+    pub async fn request_start(&self, targets: &[String], watch: bool) -> Result<StartOutcome> {
         let config = config::load_from_path(&self.config_path).with_context(|| {
             format!(
                 "loading configuration from {:?}",
@@ -402,7 +399,7 @@ impl Runner {
             Some(self.watch_spec_from_config(&config, &rufa_watch_targets)?)
         };
 
-        Ok(LaunchOutcome { rufa_watch })
+        Ok(StartOutcome { rufa_watch })
     }
 
     pub async fn request_stop_all(&self) -> Result<()> {
@@ -420,7 +417,7 @@ impl Runner {
         Ok(())
     }
 
-    pub async fn request_restart(&self, targets: &[String], all: bool) -> Result<LaunchOutcome> {
+    pub async fn request_restart(&self, targets: &[String], all: bool) -> Result<StartOutcome> {
         let config = config::load_from_path(&self.config_path).with_context(|| {
             format!(
                 "loading configuration from {:?}",
@@ -493,7 +490,7 @@ impl Runner {
             Some(self.watch_spec_from_config(&config, &rufa_watch_targets)?)
         };
 
-        Ok(LaunchOutcome { rufa_watch })
+        Ok(StartOutcome { rufa_watch })
     }
 
     pub async fn request_restart_from_watch(&self, target: &str) -> bool {
@@ -576,7 +573,7 @@ impl Runner {
         })
     }
 
-    pub async fn launch_targets(&self, targets: &[String], watch: bool) -> Result<LaunchOutcome> {
+    pub async fn start_targets(&self, targets: &[String], watch: bool) -> Result<StartOutcome> {
         let config = config::load_from_path(&self.config_path).with_context(|| {
             format!(
                 "loading configuration from {:?}",
@@ -589,15 +586,15 @@ impl Runner {
             bail!("no runnable targets resolved from selection");
         }
 
-        self.launch_units(&config, units, watch).await
+        self.start_units(&config, units, watch).await
     }
 
-    async fn launch_units(
+    async fn start_units(
         &self,
         config: &Config,
         units: Vec<UnitTarget>,
         watch: bool,
-    ) -> Result<LaunchOutcome> {
+    ) -> Result<StartOutcome> {
         {
             let processes = self.processes.read().await;
             for unit in &units {
@@ -743,7 +740,7 @@ impl Runner {
             Some(self.watch_spec_from_config(config, &rufa_watch_targets)?)
         };
 
-        Ok(LaunchOutcome { rufa_watch })
+        Ok(StartOutcome { rufa_watch })
     }
 
     async fn ensure_port_sentries(&self, target: &str, ports: &HashMap<String, u16>) -> Result<()> {
@@ -1028,7 +1025,7 @@ impl Runner {
         Ok(())
     }
 
-    pub async fn kill_targets(&self, targets: &[String]) -> Result<()> {
+    pub async fn stop_targets(&self, targets: &[String]) -> Result<()> {
         for target in targets {
             self.set_watch_request(target, false).await;
             self.set_desired_state_for(target, DesiredState::Stopped)

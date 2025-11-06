@@ -6,7 +6,7 @@
 - Establish workspace layout (`src/` modules), place sample `rufa.toml`, `.env`, and fixture targets for testing.
 
 ## 2. Configuration Layer
-- Define strongly typed structures mirroring sections: `[log]`, `[restart]`, `[env]`, and `[target.*]`.
+- Define strongly typed structures mirroring sections: `[log]`, `[env]`, and `[target.*]`.
 - Support target classification into `service` (long-running, restartable) and `job` (one-shot, optional timeout).
 - Support composite targets (`type = "composite"`) by recursively expanding `targets`.
 - Allow `job` targets to specify execution timeout and failure policy in configuration.
@@ -35,16 +35,16 @@
 - Ensure rotated archives are preserved (`rufa.log.1` …) and concurrent readers can gracefully handle rotation.
 
 ## 6. Command-Line Interface
-- `run`: launch targets, optional `--watch`, `--background`; handle restart policies (`BACKOFF`, `NO`) for services and honor job timeouts without restart.
+- `target start`: launch targets (respecting the daemon's watch default) and honor job timeouts without restart.
 - `info`: query daemon, display PID, port mappings (including URLs), last log lines, and debug-port info per target.
 - `log`: stream combined log file or filtered view; implement `--follow`, `--tail`, `--generation`, target filters.
-- `restart`: restart specific service targets or all (`--all`), respecting graceful shutdown and generation incrementing; reject job restart unless explicitly re-run.
+- `target restart`: restart specific service targets or all (`--all`), respecting graceful shutdown and generation incrementing; reject job restart unless explicitly re-run.
 - `stop`: terminate all running targets, flush logs, clean up lock/IPC artifacts.
 - Ship shell completion installers (bash/zsh/fish/powershell) leveraging Clap’s completion generation and provide `rufa completions <shell>` subcommand.
 
 ## 7. Watch & Restart Logic
 - Integrate `notify` to watch source paths; map file events to owning targets.
-- Queue restart requests with debounce to avoid thrashing; apply exponential backoff when restart policy demands for services.
+- Queue restart requests with debounce to avoid thrashing.
 - Ensure generations increment per restart for services, while jobs ignore watch-triggered restarts unless explicitly re-run.
 
 ## 8. Testing & Tooling
@@ -72,10 +72,10 @@
    - Launch targets with `tokio::process`, capture stdout/stderr/stdlog, push events through structured logger.
    - Implement log formatting, rotation policies, and persistence of runtime state.
 5. [x] **CLI Command Implementation**
-   - Flesh out `run`, `info`, `log`, `restart`, `stop` subcommands; integrate shell completion generation command.
+   - Flesh out `start`, `target start`, `info`, `log`, `target restart`, `stop` subcommands; integrate shell completion generation command.
    - Ensure log streaming, filtering, and generation tracking function via IPC.
-6. [x] **Watch & Restart Policies**
-   - Connect file watcher to restart queue, apply debounce/backoff, respect service/job semantics and timeouts.
+6. [x] **Watch & Restart Flow**
+   - Connect file watcher to restart queue, apply debounce, respect service/job semantics and timeouts.
    - Extract debug port info from logs and surface via `info`.
 7. [ ] **Quality & Documentation**
    - Expand integration tests and add example fixtures; finalize README and agent documentation.

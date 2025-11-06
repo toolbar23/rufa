@@ -22,8 +22,8 @@ use tokio::{
 use crate::config::{self, Config, Target, TargetBehavior, WatchPreference};
 use crate::ipc::{
     AvailableTargetSummary, BehaviorKind, ConfigureRequest, ControlStateSummary, ExitDetails,
-    InfoRequest, InfoResponse, KillRequest, LockInfo, LogRequest, PortSummary, RestartRequest,
-    RunRequest, lock,
+    InfoRequest, InfoResponse, LockInfo, LogRequest, PortSummary, RestartRequest,
+    StartTargetsRequest, StopTargetsRequest, lock,
     protocol::{
         ClientCommand, RunHistorySummary, RunningTargetSummary, ServerResponse,
         StoppedTargetSummary, TargetConfigSummary, TargetGenerationSummary, TargetRunState,
@@ -57,12 +57,12 @@ impl IpcClient {
         self.send(ClientCommand::Ping).await
     }
 
-    pub async fn run(&self, request: RunRequest) -> Result<ServerResponse> {
-        self.send(ClientCommand::Run(request)).await
+    pub async fn start_targets(&self, request: StartTargetsRequest) -> Result<ServerResponse> {
+        self.send(ClientCommand::StartTargets(request)).await
     }
 
-    pub async fn kill(&self, request: KillRequest) -> Result<ServerResponse> {
-        self.send(ClientCommand::Kill(request)).await
+    pub async fn stop_targets(&self, request: StopTargetsRequest) -> Result<ServerResponse> {
+        self.send(ClientCommand::StopTargets(request)).await
     }
 
     pub async fn configure(&self, request: ConfigureRequest) -> Result<ServerResponse> {
@@ -299,18 +299,16 @@ async fn handle_connection(stream: UnixStream, context: Arc<ServerContext>) -> R
 
     let response = match command {
         ClientCommand::Ping => ServerResponse::Ack,
-        ClientCommand::Run(request) => {
-            let watch = request
-                .watch
-                .unwrap_or_else(|| context.default_watch.load(Ordering::SeqCst));
+        ClientCommand::StartTargets(request) => {
+            let watch = context.default_watch.load(Ordering::SeqCst);
 
             tracing::info!(
                 targets = ?request.targets,
                 watch,
-                "received run request"
+                "received start request"
             );
 
-            match context.runner.request_run(&request.targets, watch).await {
+            match context.runner.request_start(&request.targets, watch).await {
                 Ok(outcome) => {
                     if let Some(spec) = outcome.rufa_watch {
                         if let Err(error) = context
@@ -327,7 +325,7 @@ async fn handle_connection(stream: UnixStream, context: Arc<ServerContext>) -> R
                     ServerResponse::Ack
                 }
                 Err(error) => {
-                    tracing::error!(%error, "failed to queue run request");
+                    tracing::error!(%error, "failed to queue start request");
                     ServerResponse::Error(error.to_string())
                 }
             }
@@ -409,15 +407,15 @@ async fn handle_connection(stream: UnixStream, context: Arc<ServerContext>) -> R
                 }
             }
         }
-        ClientCommand::Kill(request) => {
-            tracing::info!(targets = ?request.targets, "received kill request");
+        ClientCommand::StopTargets(request) => {
+            tracing::info!(targets = ?request.targets, "received stop request");
             if request.targets.is_empty() {
                 ServerResponse::Ack
             } else {
-                match context.runner.kill_targets(&request.targets).await {
+                match context.runner.stop_targets(&request.targets).await {
                     Ok(()) => ServerResponse::Ack,
                     Err(error) => {
-                        tracing::error!(%error, "failed to kill targets");
+                        tracing::error!(%error, "failed to stop targets");
                         ServerResponse::Error(error.to_string())
                     }
                 }

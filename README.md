@@ -13,7 +13,7 @@ rufa is a Rust command-line assistant designed to keep coding agents in sync wit
 - Services vs. jobs: services restart automatically, jobs run once with optional timeouts.
 - Structured logging with rotation and history retention.
 - Composite targets that bundle multiple services together.
-- File watching for automatic restarts and backoff policies for unstable targets.
+- File watching with configurable debounce for automatic restarts.
 - Debug port discovery surfaced through the `info` subcommand.
 
 ## Configuration Overview
@@ -25,9 +25,6 @@ file = "rufa.log"
 rotation_after_seconds = 86400
 rotation_after_size_mb = 10
 keep_history_count = 5
-
-[restart]
-type = "BACKOFF"
 
 [env]
 read_env_file = ".env"
@@ -63,7 +60,7 @@ command = "./scripts/cleanup.sh"
 ```
 
 ### Target Kinds
-- `service`: long-running process that should be supervised and restarted according to policy.
+- `service`: long-running process that rufa supervises and restarts automatically when needed.
 - `job`: one-shot task with optional `timeout_seconds`; no automatic restart.
 
 ### Target Types
@@ -86,12 +83,12 @@ Rufa ships with adapters for these target `type` values:
 - When omitted, rufa watches the entire workspace.
 - Control who handles restarts via `watch_type` (defaults to `PREFER_RUNTIME_SUPPLIED`). Use `RUFA` to force rufa-managed restarts; leave default to let runtime-specific flags (e.g., Bun `--watch`) be injected automatically.
 
-- `rufa start [--watch|--no-watch] [--foreground] [--env FILE]` – launch the daemon. By default it runs in the background; add `--foreground` to keep it attached to the terminal and mirror log output. Use `--watch` to make future runs default to restart-on-change, and supply `--env` to load variables before booting the supervisor.
-- `rufa run TARGET... [--watch|--no-watch] [--foreground]` – start one or more targets. When `--watch`/`--no-watch` is omitted, the daemon’s default (set via `rufa start`) applies. Add `--foreground` to stream just those targets’ logs and stop them with Ctrl+C.
-- `rufa kill TARGET...` – terminate running targets without shutting down the daemon.
+- `rufa start [--watch|--no-watch] [--foreground] [--env FILE]` – launch the supervisor. By default it runs in the background; add `--foreground` to keep it attached to the terminal and mirror log output. Use `--watch` to make future starts default to restart-on-change, and supply `--env` to load variables before booting the supervisor.
+- `rufa target start TARGET... [--foreground]` – start one or more targets. Add `--foreground` to stream just those targets’ logs and stop them with Ctrl+C.
+- `rufa target stop TARGET...` – stop running targets without shutting down the daemon.
 - `rufa info [--foreground] [--log-length N]` – show the currently running set, their PIDs, ports, debug addresses, and recent log lines (default 5). Add `--foreground` for a live, in-place view.
 - `rufa log [TARGET...] [--follow] [--tail N] [--generation G] [--all]` – inspect the combined log, filtered by target or generation. Defaults to showing the latest generation for each target; pass `--all` for full history. Operates directly on `rufa.log` so you can view history even if the daemon is offline.
-- `rufa restart TARGET... [--all]` – recycle services, incrementing generation counters.
+- `rufa target restart TARGET... [--all]` – recycle services, incrementing generation counters.
 - `rufa stop` – shut down the daemon and release the lockfile.
 
 All log lines follow the format:
@@ -123,10 +120,10 @@ Re-run the command after upgrading rufa so the completions stay current. Command
 ## Agent-Oriented Workflow
 1. Configure targets in `rufa.toml` (services and jobs).
 2. Start the supervisor with `rufa start` (add `--background` to detach).
-3. Launch the desired targets via `rufa run ...`.
+3. Launch the desired targets via `rufa target start ...`.
 4. Use `rufa info` to share runtime details (ports, URLs, debug ports) with the agent.
-5. The agent reads `rufa log` or tails specific targets to validate behavior after each change; use `rufa run --watch ...` (or configure the default via `rufa start --watch`) for automatic restarts.
-6. Use `rufa kill` to stop individual targets or `rufa stop` when the development session ends to clean up.
+5. The agent reads `rufa log` or tails specific targets to validate behavior after each change; enable automatic restarts by starting the daemon with `rufa start --watch`.
+6. Use `rufa target stop` to halt individual targets or `rufa stop` when the development session ends to clean up.
 
 ## Notes for Future Enhancements
 - Import launch definitions from VS Code `launch.json`.

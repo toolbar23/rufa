@@ -2,11 +2,11 @@ use super::log_io;
 use super::*;
 use crate::env::OVERRIDE_ENV_FILE_VAR;
 use crate::ipc::{
-    BehaviorKind, ConfigureRequest, InfoRequest, InfoResponse, KillRequest, RestartRequest,
-    RunHistorySummary, RunRequest, RunningTargetSummary, ServerResponse, StoppedTargetSummary,
-    TargetConfigSummary, TargetRunState, WatchPreferenceKind, connect_existing_client,
-    require_daemon_client, run_daemon, spawn_daemon_process, wait_for_daemon_ready,
-    wait_for_shutdown,
+    BehaviorKind, ConfigureRequest, InfoRequest, InfoResponse, RestartRequest, RunHistorySummary,
+    RunningTargetSummary, ServerResponse, StartTargetsRequest, StopTargetsRequest,
+    StoppedTargetSummary, TargetConfigSummary, TargetRunState, WatchPreferenceKind,
+    connect_existing_client, require_daemon_client, run_daemon, spawn_daemon_process,
+    wait_for_daemon_ready, wait_for_shutdown,
 };
 use anyhow::Context;
 use std::io::IsTerminal;
@@ -32,8 +32,8 @@ pub async fn init(_args: InitArgs) -> Result<()> {
     Ok(())
 }
 
-pub async fn start(args: StartArgs) -> Result<()> {
-    let StartArgs {
+pub async fn start_daemon(args: DaemonStartArgs) -> Result<()> {
+    let DaemonStartArgs {
         watch,
         no_watch,
         foreground,
@@ -120,28 +120,21 @@ pub async fn start(args: StartArgs) -> Result<()> {
 
         let ready_result = wait_for_daemon_ready(Duration::from_secs(5)).await;
         ready_result.context("daemon did not become ready in time")?;
-        println!("rufa daemon started; launch targets with `rufa run`");
+        println!("rufa daemon started; launch targets with `rufa target start`");
         Ok(())
     }
 }
 
-pub async fn run(args: RunArgs) -> Result<()> {
-    let RunArgs {
+pub async fn start_targets(args: TargetStartArgs) -> Result<()> {
+    let TargetStartArgs {
         targets,
-        watch,
-        no_watch,
         foreground,
     } = args;
     let display_targets = targets.clone();
 
-    let watch_setting = watch_setting_from_flags(watch, no_watch);
-
     let client = require_daemon_client().await?;
-    let request = RunRequest {
-        targets,
-        watch: watch_setting,
-    };
-    match client.run(request).await? {
+    let request = StartTargetsRequest { targets };
+    match client.start_targets(request).await? {
         ServerResponse::Ack => {
             if foreground {
                 println!(
@@ -192,19 +185,19 @@ pub async fn run(args: RunArgs) -> Result<()> {
 
                 drop(follow_future);
 
-                let kill_request = KillRequest {
+                let stop_request = StopTargetsRequest {
                     targets: display_targets.clone(),
                 };
-                match client.kill(kill_request).await {
+                match client.stop_targets(stop_request).await {
                     Ok(ServerResponse::Ack | ServerResponse::Info(_)) => {
                         println!(
-                            "sent kill signal for targets: {}",
+                            "sent stop signal for targets: {}",
                             display_targets.join(", ")
                         );
                         Ok(())
                     }
                     Ok(ServerResponse::Error(message)) => bail!(message),
-                    Err(error) => Err(error).context("failed to send kill request"),
+                    Err(error) => Err(error).context("failed to send stop request"),
                 }
             } else {
                 println!(
@@ -215,24 +208,21 @@ pub async fn run(args: RunArgs) -> Result<()> {
             }
         }
         ServerResponse::Info(_) => {
-            println!("run request returned additional info:");
+            println!("start request returned additional info:");
             Ok(())
         }
         ServerResponse::Error(message) => bail!(message),
     }
 }
 
-pub async fn kill(args: KillArgs) -> Result<()> {
-    let KillArgs { targets } = args;
+pub async fn stop_targets(args: TargetStopArgs) -> Result<()> {
+    let TargetStopArgs { targets } = args;
     let display_targets = targets.clone();
     let client = require_daemon_client().await?;
-    let request = KillRequest { targets };
-    match client.kill(request).await? {
+    let request = StopTargetsRequest { targets };
+    match client.stop_targets(request).await? {
         ServerResponse::Ack => {
-            println!(
-                "requested termination for targets: {}",
-                display_targets.join(", ")
-            );
+            println!("requested stop for targets: {}", display_targets.join(", "));
             Ok(())
         }
         ServerResponse::Info(_) => Ok(()),
@@ -389,11 +379,11 @@ pub async fn log(args: LogArgs) -> Result<()> {
     }
 }
 
-pub async fn restart(args: RestartArgs) -> Result<()> {
+pub async fn restart_targets(args: TargetRestartArgs) -> Result<()> {
     if args.all && !args.targets.is_empty() {
         bail!("cannot combine explicit targets with --all");
     }
-    let RestartArgs { targets, all } = args;
+    let TargetRestartArgs { targets, all } = args;
 
     let client = require_daemon_client().await?;
     let request = RestartRequest {
@@ -422,7 +412,7 @@ pub async fn restart(args: RestartArgs) -> Result<()> {
     }
 }
 
-pub async fn stop() -> Result<()> {
+pub async fn stop_daemon() -> Result<()> {
     let Some(client) = connect_existing_client().await? else {
         println!("rufa daemon is not running");
         return Ok(());
@@ -871,14 +861,11 @@ rotation_after_seconds = 86400
 rotation_after_size_mb = 10
 keep_history_count = 5
 
-[restart]
-type = "BACKOFF"
-
 [env]
 read_env_file = ".env"
 
 [watch]
-stability = "2s"
+stability_seconds = 2
 
 [target.sample]
 kind = "service"
@@ -968,10 +955,10 @@ fn handle_agents_md(root: &Path) -> Result<()> {
     let section = r#"## Working with rufa
 
 - Start the supervisor once per repo: `rufa start --watch`.
-- Launch targets as needed, for example `rufa run sample`.
+- Launch targets as needed, for example `rufa target start sample`.
 - Check `rufa info` for port assignments and active processes.
 - Tail recent output with `rufa log --tail 20 --follow`.
-- Update `.env` and rerun `rufa run …` when environment changes.
+- Update `.env` and rerun `rufa target start …` when environment changes.
 "#;
 
     let mut preview = String::new();

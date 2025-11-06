@@ -14,8 +14,6 @@ pub enum ConfigError {
     Parse(#[from] toml::de::Error),
     #[error("missing '{field}' for target '{target}'")]
     MissingField { target: String, field: &'static str },
-    #[error("unknown restart type '{value}'")]
-    UnknownRestartType { value: String },
     #[error("unknown target kind '{value}' for target '{target}'")]
     UnknownTargetKind { target: String, value: String },
     #[error("composite target '{target}' requires at least one member")]

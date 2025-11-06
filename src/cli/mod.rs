@@ -13,15 +13,17 @@ pub struct Cli {
 impl Cli {
     pub async fn execute(self) -> Result<()> {
         match self.command {
-            Command::Start(args) => handlers::start(args).await,
-            Command::Run(args) => handlers::run(args).await,
-            Command::Kill(args) => handlers::kill(args).await,
+            Command::Start(args) => handlers::start_daemon(args).await,
+            Command::Stop => handlers::stop_daemon().await,
+            Command::Target(cmd) => match cmd {
+                TargetCommand::Start(args) => handlers::start_targets(args).await,
+                TargetCommand::Stop(args) => handlers::stop_targets(args).await,
+                TargetCommand::Restart(args) => handlers::restart_targets(args).await,
+            },
             Command::Info(args) => handlers::info(args).await,
             Command::Log(args) => handlers::log(args).await,
-            Command::Restart(args) => handlers::restart(args).await,
-            Command::Stop => handlers::stop().await,
             Command::Completions(args) => handlers::completions(args),
-            Command::Daemon => handlers::daemon().await,
+            Command::DaemonForeground => handlers::daemon().await,
             Command::Init(args) => handlers::init(args).await,
         }
     }
@@ -30,30 +32,37 @@ impl Cli {
 #[derive(Subcommand, Debug)]
 pub enum Command {
     /// Start the rufa daemon
-    Start(StartArgs),
-    /// Run one or more targets
-    Run(RunArgs),
-    /// Kill running targets
-    Kill(KillArgs),
+    Start(DaemonStartArgs),
+    /// Stop the rufa daemon
+    Stop,
+    /// Manage individual targets
+    #[command(subcommand)]
+    Target(TargetCommand),
     /// Show info about running targets
     Info(InfoArgs),
     /// Stream logs from the supervisor
     Log(LogArgs),
-    /// Restart running services
-    Restart(RestartArgs),
-    /// Stop all managed targets
-    Stop,
     /// Generate shell completions
     Completions(CompletionsArgs),
-    /// Internal daemon entry point (hidden)
-    #[command(hide = true, alias = "__daemon")]
-    Daemon,
     /// Prepare the repository to use rufa
     Init(InitArgs),
+    /// Internal daemon entry point (hidden)
+    #[command(hide = true, alias = "__daemon")]
+    DaemonForeground,
+}
+
+#[derive(Subcommand, Debug)]
+pub enum TargetCommand {
+    /// Start one or more targets
+    Start(TargetStartArgs),
+    /// Stop running targets
+    Stop(TargetStopArgs),
+    /// Restart running services
+    Restart(TargetRestartArgs),
 }
 
 #[derive(Args, Debug)]
-pub struct StartArgs {
+pub struct DaemonStartArgs {
     /// Enable watch mode by default for subsequent runs
     #[arg(long, short = 'w', action = ArgAction::SetTrue, conflicts_with = "no_watch")]
     pub watch: bool,
@@ -72,18 +81,10 @@ pub struct StartArgs {
 }
 
 #[derive(Args, Debug)]
-pub struct RunArgs {
-    /// Targets to run
+pub struct TargetStartArgs {
+    /// Targets to start
     #[arg(required = true)]
     pub targets: Vec<String>,
-
-    /// Enable watch mode for these targets
-    #[arg(long, short = 'w', action = ArgAction::SetTrue, conflicts_with = "no_watch")]
-    pub watch: bool,
-
-    /// Disable watch mode for these targets
-    #[arg(long = "no-watch", action = ArgAction::SetTrue, conflicts_with = "watch")]
-    pub no_watch: bool,
 
     /// Stay attached and stream logs for these targets
     #[arg(long, short = 'f')]
@@ -91,8 +92,8 @@ pub struct RunArgs {
 }
 
 #[derive(Args, Debug)]
-pub struct KillArgs {
-    /// Targets to terminate
+pub struct TargetStopArgs {
+    /// Targets to stop
     #[arg(required = true)]
     pub targets: Vec<String>,
 }
@@ -140,7 +141,7 @@ pub struct LogArgs {
 }
 
 #[derive(Args, Debug, Default)]
-pub struct RestartArgs {
+pub struct TargetRestartArgs {
     /// Targets to restart (default none)
     #[arg()]
     pub targets: Vec<String>,
