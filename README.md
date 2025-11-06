@@ -16,6 +16,13 @@ rufa is a Rust command-line assistant designed to keep coding agents in sync wit
 - File watching with configurable debounce for automatic restarts.
 - Debug port discovery surfaced through the `info` subcommand.
 
+## System Requirements
+- 64-bit Linux or macOS. IPC currently relies on Unix domain sockets; Windows support is planned but not available yet.
+- A recent Rust toolchain that understands edition 2024 if you are building from source (`rustup default nightly` works today).
+- File-watching support via the OS (inotify/FSEvents/kqueue). Ensure your environment exposes these facilities.
+- Target-specific toolchains (JVM, Bun, Cargo, Bash, etc.) must be installed if referenced by `rufa.toml`.
+- TCP ports declared in `rufa.toml` must be available for binding when the daemon starts.
+
 ## Configuration Overview
 Create `rufa.toml` at the project root. Example:
 
@@ -81,17 +88,34 @@ Rufa ships with adapters for these target `type` values:
 - Services refresh automatically when files change if refresh-on-change is set to `auto`.
 - Add `watch = ["relative/path", "/abs/path"]` to a service target to restrict restarts to specific directories.
 - When omitted, rufa watches the entire workspace.
-- Control who handles refreshes via `refresh_watch_type` (defaults to `PREFER_RUNTIME_SUPPLIED`). Use `RUFA` to force rufa-managed restarts; leave the default to let runtime-specific flags (e.g., Bun `--watch`) be injected automatically when refresh-on-change is enabled.
+- Control who handles refreshes via `refresh_watch_type` (default `RUFA`). Switch to `PREFER_RUNTIME_SUPPLIED` when you want the target driver to run in its own watch mode (for example Bun `--watch`) while rufa coordinates restarts.
 
-- `rufa start [--foreground] [--env FILE]` – launch the supervisor. By default it runs in the background; add `--foreground` to keep it attached to the terminal and mirror log output. Supply `--env` to load variables before booting the supervisor.
-- `rufa refresh set {auto|off}` – toggle automatic refresh-on-change for runtime-managed services.
-- `rufa refresh stale-targets` – restart services that saw changes while refresh-on-change was disabled.
-- `rufa target start TARGET... [--foreground]` – start one or more targets. Add `--foreground` to stream just those targets’ logs and stop them with Ctrl+C.
-- `rufa target stop TARGET...` – stop running targets without shutting down the daemon.
-- `rufa info [--foreground] [--log-length N]` – show the currently running set, their PIDs, ports, debug addresses, and recent log lines (default 5). Add `--foreground` for a live, in-place view.
-- `rufa log [TARGET...] [--follow] [--tail N] [--generation G] [--all]` – inspect the combined log, filtered by target or generation. Defaults to showing the latest generation for each target; pass `--all` for full history. Operates directly on `rufa.log` so you can view history even if the daemon is offline.
-- `rufa target restart TARGET... [--all]` – recycle services, incrementing generation counters.
-- `rufa stop` – shut down the daemon and release the lockfile.
+## CLI Reference
+
+Run `rufa --help` to see top-level commands. Invoking `rufa` without a subcommand is equivalent to `rufa info`.
+
+### Daemon lifecycle
+- `rufa start [--foreground] [--env FILE]`
+  - `-f, --foreground` keeps the daemon attached to your terminal and mirrors log output.
+  - `-e, --env FILE` loads extra environment variables before spawning the daemon.
+- `rufa stop` shuts down the daemon and releases the IPC socket.
+
+### Refresh policy
+- `rufa refresh set {auto|off}` toggles whether file changes trigger immediate restarts.
+- `rufa refresh stale-targets` restarts services that recorded changes while refresh was disabled.
+
+### Target orchestration
+- `rufa target start <TARGET>... [--foreground]` launches one or more targets. Adding `--foreground` (`-f`) streams their logs until interrupted.
+- `rufa target stop <TARGET>...` stops specific targets without affecting others.
+- `rufa target restart [<TARGET>...] [--all]` restarts selected targets; use `--all` (`-a`) to restart every running service.
+
+### Observability
+- `rufa info [<TARGET>...] [--log-length N] [--foreground] [--history-length N]` prints supervisor state, ports, and recent log lines. `--log-length` (`-n`) controls the number of lines, `--foreground` (`-f`) turns it into a live dashboard, and `--history-length` widens the run history.
+- `rufa log [<TARGET>...] [--follow] [--tail N] [--generation G | --all]` inspects the aggregated structured log. `--follow` (`-f`) streams new entries, `--tail` (`-t`) primes the log with N lines, `--generation` (`-g`) selects a specific run, and `--all` streams every recorded generation.
+
+### Tooling
+- `rufa completions {bash|zsh|fish|powershell}` emits shell completion scripts. Re-run after upgrades.
+- `rufa init` scaffolds `rufa.toml`, `.gitignore` entries, and supporting docs for the current repository.
 
 All log lines follow the format:
 
@@ -121,7 +145,7 @@ Re-run the command after upgrading rufa so the completions stay current. Command
 
 ## Agent-Oriented Workflow
 1. Configure targets in `rufa.toml` (services and jobs).
-2. Start the supervisor with `rufa start` (add `--background` to detach).
+2. Start the supervisor with `rufa start` (add `--foreground` if you prefer to stay attached).
 3. Launch the desired targets via `rufa target start ...`.
 4. Use `rufa info` to share runtime details (ports, URLs, debug ports) with the agent.
 5. The agent reads `rufa log` or tails specific targets to validate behavior after each change; enable automatic refreshes by running `rufa refresh set auto`.
