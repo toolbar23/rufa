@@ -542,6 +542,7 @@ impl Runner {
     }
 
     pub async fn request_restart_from_watch(&self, target: &str) -> bool {
+        tracing::debug!(target = %target, "evaluating watch-triggered restart");
         let should_consider = {
             let guard = self.controls.read().await;
             guard
@@ -553,6 +554,7 @@ impl Runner {
                 .unwrap_or(false)
         };
         if !should_consider {
+            tracing::debug!(target = %target, "watch restart skipped (target not running service)");
             return false;
         }
 
@@ -561,13 +563,16 @@ impl Runner {
         let (runtime_watch, rufa_watch) = {
             let mut state_guard = self.state.write().await;
             let Some(entry) = state_guard.targets.get_mut(target) else {
+                tracing::debug!(target = %target, "watch restart skipped (target state missing)");
                 return false;
             };
             if !entry.rufa_watch {
+                tracing::debug!(target = %target, "watch restart skipped (target not tracked by rufa watch)");
                 return false;
             }
             if !refresh_enabled {
                 entry.change_noticed_restart_necessary = true;
+                tracing::debug!(target = %target, "watch restart deferred (refresh disabled; marked stale)");
                 return false;
             }
             entry.change_noticed_restart_necessary = false;
@@ -575,6 +580,12 @@ impl Runner {
         };
 
         if runtime_watch || !rufa_watch {
+            tracing::debug!(
+                target = %target,
+                runtime_watch,
+                rufa_watch,
+                "watch restart skipped (runtime-managed or not eligible)"
+            );
             return false;
         }
 
@@ -584,9 +595,11 @@ impl Runner {
                 && matches!(control.desired_state, DesiredState::Running)
             {
                 control.request_desired_state(DesiredState::Restarted);
+                tracing::debug!(target = %target, "watch restart requested");
                 return true;
             }
         }
+        tracing::debug!(target = %target, "watch restart skipped (control state unavailable)");
         false
     }
 
@@ -697,11 +710,11 @@ impl Runner {
             }
         }
 
-        let assignments = self.allocate_ports(&units).await?;
         let state_snapshot = {
             let guard = self.state.read().await;
             guard.clone()
         };
+        let assignments = self.allocate_ports(&units, &state_snapshot).await?;
 
         let mut rufa_watch_targets = Vec::new();
 
@@ -721,8 +734,26 @@ impl Runner {
                 && refresh_on_change;
             let wants_rufa_watch =
                 is_service && matches!(unit.refresh_watch_type, RefreshWatchType::Rufa);
+
+            tracing::info!(
+                target = %unit.name,
+                behavior = ?unit.behavior,
+                refresh_watch_type = ?unit.refresh_watch_type,
+                refresh_on_change,
+                wants_runtime_watch,
+                wants_rufa_watch,
+                watch_paths = ?unit.watch_paths,
+                "evaluating target for watch configuration"
+            );
+
             if wants_rufa_watch {
                 rufa_watch_targets.push(unit.name.clone());
+                tracing::info!(target = %unit.name, "target will use rufa-managed watching");
+            } else if is_service {
+                tracing::info!(
+                    target = %unit.name,
+                    "service target will not use rufa-managed watching"
+                );
             }
 
             let command_line = resolve_command(&unit, wants_runtime_watch)
@@ -772,9 +803,26 @@ impl Runner {
         }
 
         let rufa_watch = if rufa_watch_targets.is_empty() {
+            tracing::info!("start request produced no rufa-managed watch targets");
             None
         } else {
-            Some(self.watch_spec_from_config(config, &rufa_watch_targets)?)
+            let spec = self.watch_spec_from_config(config, &rufa_watch_targets)?;
+            let mut service_dirs: HashMap<String, Vec<String>> = HashMap::new();
+            for (service, paths) in &spec.services {
+                service_dirs.insert(
+                    service.clone(),
+                    paths
+                        .iter()
+                        .map(|path| path.display().to_string())
+                        .collect(),
+                );
+            }
+            tracing::info!(
+                services = ?service_dirs,
+                stability_secs = spec.stability.as_secs_f64(),
+                "start request resolved rufa watch specification"
+            );
+            Some(spec)
         };
 
         Ok(StartOutcome { rufa_watch })
@@ -813,15 +861,45 @@ impl Runner {
     async fn allocate_ports(
         &self,
         units: &[UnitTarget],
+        previous: &RuntimeState,
     ) -> Result<HashMap<TargetName, HashMap<String, u16>>> {
         let mut allocator = self.port_allocator.lock().await;
         let mut assignments = HashMap::new();
         for unit in units {
             let mut ports = HashMap::new();
+            let previous_ports = previous
+                .targets
+                .get(&unit.name)
+                .map(|state| state.ports.clone())
+                .unwrap_or_default();
             for (name, definition) in &unit.ports {
-                let port = allocator
-                    .allocate(definition.selection)
-                    .with_context(|| format!("allocating port for {}.{}", unit.name, name))?;
+                let mut assigned = None;
+                if let Some(prev) = previous_ports.get(name) {
+                    if definition.selection.permits(*prev) {
+                        match allocator.reserve_specific(*prev) {
+                            Ok(()) => {
+                                assigned = Some(*prev);
+                            }
+                            Err(error) => {
+                                tracing::debug!(
+                                    target = %unit.name,
+                                    port_name = %name,
+                                    port = *prev,
+                                    %error,
+                                    "previous port unavailable; allocating a new one"
+                                );
+                            }
+                        }
+                    }
+                }
+
+                let port = if let Some(port) = assigned {
+                    port
+                } else {
+                    allocator
+                        .allocate(definition.selection)
+                        .with_context(|| format!("allocating port for {}.{}", unit.name, name))?
+                };
                 ports.insert(name.clone(), port);
             }
             assignments.insert(unit.name.clone(), ports);

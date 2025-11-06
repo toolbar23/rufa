@@ -43,6 +43,7 @@ fn should_default_to_info(args: &[OsString]) -> bool {
         "start",
         "stop",
         "target",
+        "refresh",
         "info",
         "log",
         "completions",
@@ -59,4 +60,32 @@ fn should_default_to_info(args: &[OsString]) -> bool {
     }
 
     true
+}
+
+#[cfg(test)]
+mod tests {
+    use super::should_default_to_info;
+    use std::ffi::OsString;
+
+    fn args(items: &[&str]) -> Vec<OsString> {
+        items.iter().map(|item| OsString::from(item)).collect()
+    }
+
+    #[test]
+    fn defaults_when_no_command() {
+        let args = args(&["rufa"]);
+        assert!(should_default_to_info(&args));
+    }
+
+    #[test]
+    fn does_not_default_for_refresh_command() {
+        let args = args(&["rufa", "refresh"]);
+        assert!(!should_default_to_info(&args));
+    }
+
+    #[test]
+    fn does_not_default_for_refresh_with_subcommand_arguments() {
+        let args = args(&["rufa", "refresh", "set", "auto"]);
+        assert!(!should_default_to_info(&args));
+    }
 }

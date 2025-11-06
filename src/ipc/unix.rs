@@ -318,6 +318,13 @@ async fn handle_connection(stream: UnixStream, context: Arc<ServerContext>) -> R
             match context.runner.request_start(&request.targets).await {
                 Ok(outcome) => {
                     if let Some(spec) = outcome.rufa_watch {
+                        let service_names: Vec<String> = spec.services.keys().cloned().collect();
+                        let stability = spec.stability;
+                        tracing::info!(
+                            services = ?service_names,
+                            stability_secs = stability.as_secs_f64(),
+                            "enabling file watcher after start request"
+                        );
                         if let Err(error) = context
                             .watch
                             .enable_watch(context.runner.clone(), spec)
@@ -395,6 +402,13 @@ async fn handle_connection(stream: UnixStream, context: Arc<ServerContext>) -> R
             {
                 Ok(outcome) => {
                     if let Some(spec) = outcome.rufa_watch {
+                        let service_names: Vec<String> = spec.services.keys().cloned().collect();
+                        let stability = spec.stability;
+                        tracing::info!(
+                            services = ?service_names,
+                            stability_secs = stability.as_secs_f64(),
+                            "enabling file watcher after restart request"
+                        );
                         if let Err(error) = context
                             .watch
                             .enable_watch(context.runner.clone(), spec)
@@ -449,6 +463,14 @@ async fn handle_connection(stream: UnixStream, context: Arc<ServerContext>) -> R
                                 );
                             }
                             if let Some(spec) = outcome.rufa_watch {
+                                let service_names: Vec<String> =
+                                    spec.services.keys().cloned().collect();
+                                let stability = spec.stability;
+                                tracing::info!(
+                                    services = ?service_names,
+                                    stability_secs = stability.as_secs_f64(),
+                                    "enabling file watcher after refresh setting change"
+                                );
                                 if let Err(error) = context
                                     .watch
                                     .enable_watch(context.runner.clone(), spec)
@@ -490,6 +512,14 @@ async fn handle_connection(stream: UnixStream, context: Arc<ServerContext>) -> R
                             );
                         }
                         if let Some(spec) = outcome.rufa_watch {
+                            let service_names: Vec<String> =
+                                spec.services.keys().cloned().collect();
+                            let stability = spec.stability;
+                            tracing::info!(
+                                services = ?service_names,
+                                stability_secs = stability.as_secs_f64(),
+                                "enabling file watcher after refreshing stale targets"
+                            );
                             if let Err(error) = context
                                 .watch
                                 .enable_watch(context.runner.clone(), spec)

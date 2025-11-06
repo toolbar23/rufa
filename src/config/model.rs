@@ -178,6 +178,14 @@ impl PortSelection {
             PortSelection::Fixed(value) => (*value, *value),
         }
     }
+
+    pub fn permits(&self, port: u16) -> bool {
+        match self {
+            PortSelection::Auto => true,
+            PortSelection::AutoRange { start, end } => port >= *start && port <= *end,
+            PortSelection::Fixed(value) => *value == port,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -188,6 +196,6 @@ pub enum RefreshWatchType {
 
 impl Default for RefreshWatchType {
     fn default() -> Self {
-        RefreshWatchType::PreferRuntimeSupplied
+        RefreshWatchType::Rufa
     }
 }

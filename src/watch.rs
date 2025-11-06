@@ -76,13 +76,28 @@ impl WatchManager {
                 match event {
                     Ok(event) => {
                         let matches = matched_targets(&event, services_for_task.as_ref());
+                        let paths = format_paths(&event.paths);
                         if matches.is_empty() {
+                            debug!(
+                                kind = ?event.kind,
+                                paths = ?paths,
+                                "watch event ignored (no matching targets)"
+                            );
                             continue;
                         }
 
                         let Some(runner) = runner_weak.upgrade() else {
+                            info!("watch runner dropped; stopping watch task");
                             break;
                         };
+
+                        info!(
+                            kind = ?event.kind,
+                            paths = ?paths,
+                            targets = ?matches,
+                            debounce_secs = debounce.as_secs_f64(),
+                            "watch change detected; coalescing events"
+                        );
 
                         {
                             let mut guard = pending_targets.lock().await;
@@ -92,6 +107,7 @@ impl WatchManager {
                         }
 
                         if pending.swap(true, Ordering::SeqCst) {
+                            debug!("watch debounce already pending; coalescing event");
                             continue;
                         }
 
@@ -107,14 +123,20 @@ impl WatchManager {
                                 items
                             };
 
-                            if !targets.is_empty() {
+                            if targets.is_empty() {
+                                info!("watch debounce fired but no targets pending restart");
+                            } else {
+                                info!(
+                                    targets = ?targets,
+                                    "watch debounce fired; evaluating restart eligibility"
+                                );
                                 for target in targets {
                                     if runner_clone.request_restart_from_watch(&target).await {
                                         info!(target = %target, "watch-triggered restart queued");
                                     } else {
-                                        debug!(
+                                        info!(
                                             target = %target,
-                                            "watch change ignored (state not eligible)"
+                                            "watch change observed but restart not queued"
                                         );
                                     }
                                 }
@@ -234,4 +256,11 @@ fn matched_targets(event: &Event, services: &HashMap<String, Vec<PathBuf>>) -> V
     }
 
     matched.into_iter().collect()
+}
+
+fn format_paths(paths: &[PathBuf]) -> Vec<String> {
+    paths
+        .iter()
+        .map(|path| path.display().to_string())
+        .collect()
 }

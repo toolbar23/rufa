@@ -641,10 +641,7 @@ port.metrics.fixed = 9100
                 .iter()
                 .any(|path| path.ends_with("modules/shared"))
         );
-        assert_eq!(
-            prg1.refresh_watch_type,
-            RefreshWatchType::PreferRuntimeSupplied
-        );
+        assert_eq!(prg1.refresh_watch_type, RefreshWatchType::Rufa);
         let http_port = prg1.ports.get("http").expect("http port");
         assert_eq!(http_port.protocol, PortProtocol::Http);
         assert_eq!(

@@ -21,6 +21,17 @@ pub(crate) struct PortAllocator {
 }
 
 impl PortAllocator {
+    pub(crate) fn reserve_specific(&mut self, port: u16) -> Result<()> {
+        if self.reserved.contains(&port) {
+            bail!("port {port} is already reserved");
+        }
+
+        TcpListener::bind(("127.0.0.1", port))
+            .context(format!("binding to specific port {port}"))?;
+        self.reserved.insert(port);
+        Ok(())
+    }
+
     pub(crate) fn allocate(&mut self, selection: PortSelection) -> Result<u16> {
         match selection {
             PortSelection::Auto => self.allocate_ephemeral(),
@@ -46,11 +57,8 @@ impl PortAllocator {
             .context("binding to ephemeral port for allocation")?;
         let port = listener.local_addr()?.port();
         drop(listener);
-        if self.reserved.insert(port) {
-            Ok(port)
-        } else {
-            self.allocate_ephemeral()
-        }
+        self.reserved.insert(port);
+        Ok(port)
     }
 
     fn allocate_from_range(&mut self, start: u16, end: u16) -> Result<u16> {
@@ -58,8 +66,7 @@ impl PortAllocator {
             if self.reserved.contains(&port) {
                 continue;
             }
-            if TcpListener::bind(("127.0.0.1", port)).is_ok() {
-                self.reserved.insert(port);
+            if self.reserve_specific(port).is_ok() {
                 return Ok(port);
             }
         }
@@ -67,15 +74,7 @@ impl PortAllocator {
     }
 
     fn allocate_fixed(&mut self, port: u16) -> Result<()> {
-        if self.reserved.contains(&port) {
-            bail!("port {port} is already reserved");
-        }
-
-        TcpListener::bind(("127.0.0.1", port))
-            .map(|listener| drop(listener))
-            .with_context(|| format!("port {port} is not available"))?;
-        self.reserved.insert(port);
-        Ok(())
+        self.reserve_specific(port)
     }
 }
 

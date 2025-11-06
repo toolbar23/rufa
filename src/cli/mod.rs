@@ -33,35 +33,44 @@ impl Cli {
 #[derive(Subcommand, Debug)]
 pub enum Command {
     /// Start the rufa daemon
+    #[command(alias = "s")]
     Start(DaemonStartArgs),
     /// Stop the rufa daemon
+    #[command(alias = "st")]
     Stop,
     /// Manage refresh settings
-    #[command(subcommand)]
+    #[command(subcommand, alias = "r")]
     Refresh(RefreshCliCommand),
     /// Manage individual targets
-    #[command(subcommand)]
+    #[command(subcommand, alias = "t")]
     Target(TargetCommand),
     /// Show info about running targets
+    #[command(alias = "i")]
     Info(InfoArgs),
     /// Stream logs from the supervisor
+    #[command(alias = "l")]
     Log(LogArgs),
     /// Generate shell completions
+    #[command(alias = "c")]
     Completions(CompletionsArgs),
     /// Prepare the repository to use rufa
+    #[command(alias = "in")]
     Init(InitArgs),
     /// Internal daemon entry point (hidden)
-    #[command(hide = true, alias = "__daemon")]
+    #[command(hide = true, aliases = ["__daemon", "df"])]
     DaemonForeground,
 }
 
 #[derive(Subcommand, Debug)]
 pub enum TargetCommand {
     /// Start one or more targets
+    #[command(alias = "s")]
     Start(TargetStartArgs),
     /// Stop running targets
+    #[command(alias = "st")]
     Stop(TargetStopArgs),
     /// Restart running services
+    #[command(alias = "r")]
     Restart(TargetRestartArgs),
 }
 
@@ -79,8 +88,10 @@ pub struct DaemonStartArgs {
 #[derive(Subcommand, Debug)]
 pub enum RefreshCliCommand {
     /// Configure automatic refresh handling
+    #[command(alias = "s")]
     Set(RefreshSetArgs),
     /// Restart targets flagged as needing refresh
+    #[command(alias = "st")]
     StaleTargets,
 }
 
