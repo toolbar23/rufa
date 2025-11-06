@@ -1,5 +1,5 @@
 use anyhow::{Result, bail};
-use clap::{ArgAction, Args, Parser, Subcommand, ValueEnum, builder::PossibleValue};
+use clap::{Args, Parser, Subcommand, ValueEnum, builder::PossibleValue};
 use clap_complete::Shell;
 use std::path::PathBuf;
 
@@ -15,6 +15,7 @@ impl Cli {
         match self.command {
             Command::Start(args) => handlers::start_daemon(args).await,
             Command::Stop => handlers::stop_daemon().await,
+            Command::Refresh(cmd) => handlers::refresh(cmd).await,
             Command::Target(cmd) => match cmd {
                 TargetCommand::Start(args) => handlers::start_targets(args).await,
                 TargetCommand::Stop(args) => handlers::stop_targets(args).await,
@@ -35,6 +36,9 @@ pub enum Command {
     Start(DaemonStartArgs),
     /// Stop the rufa daemon
     Stop,
+    /// Manage refresh settings
+    #[command(subcommand)]
+    Refresh(RefreshCliCommand),
     /// Manage individual targets
     #[command(subcommand)]
     Target(TargetCommand),
@@ -63,14 +67,6 @@ pub enum TargetCommand {
 
 #[derive(Args, Debug)]
 pub struct DaemonStartArgs {
-    /// Enable watch mode by default for subsequent runs
-    #[arg(long, short = 'w', action = ArgAction::SetTrue, conflicts_with = "no_watch")]
-    pub watch: bool,
-
-    /// Disable watch mode by default for subsequent runs
-    #[arg(long = "no-watch", action = ArgAction::SetTrue, conflicts_with = "watch")]
-    pub no_watch: bool,
-
     /// Keep the daemon attached to the terminal and stream logs
     #[arg(long, short = 'f')]
     pub foreground: bool,
@@ -78,6 +74,41 @@ pub struct DaemonStartArgs {
     /// Load environment variables for the daemon from the given file
     #[arg(long = "env", short = 'e', value_name = "FILE")]
     pub env_file: Option<PathBuf>,
+}
+
+#[derive(Subcommand, Debug)]
+pub enum RefreshCliCommand {
+    /// Configure automatic refresh handling
+    Set(RefreshSetArgs),
+    /// Restart targets flagged as needing refresh
+    StaleTargets,
+}
+
+#[derive(Args, Debug)]
+pub struct RefreshSetArgs {
+    /// Refresh policy
+    #[arg(value_enum)]
+    pub mode: RefreshModeArg,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RefreshModeArg {
+    Auto,
+    Off,
+}
+
+impl ValueEnum for RefreshModeArg {
+    fn value_variants<'a>() -> &'a [Self] {
+        &[RefreshModeArg::Auto, RefreshModeArg::Off]
+    }
+
+    fn to_possible_value(&self) -> Option<PossibleValue> {
+        let value = match self {
+            RefreshModeArg::Auto => "auto",
+            RefreshModeArg::Off => "off",
+        };
+        Some(PossibleValue::new(value))
+    }
 }
 
 #[derive(Args, Debug)]

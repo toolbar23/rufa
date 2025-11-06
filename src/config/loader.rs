@@ -9,8 +9,8 @@ use super::{
     error::{ConfigError, ConfigResult},
     model::{
         CompositeTarget, Config, DebugUpdateConfig, EnvConfig, EnvReference, EnvValue, LogConfig,
-        PortDefinition, PortProtocol, PortSelection, ReferenceResource, RunHistoryConfig, Target,
-        TargetBehavior, TargetName, UnitTarget, WatchConfig, WatchPreference,
+        PortDefinition, PortProtocol, PortSelection, ReferenceResource, RefreshWatchType,
+        RunHistoryConfig, Target, TargetBehavior, TargetName, UnitTarget, WatchConfig,
     },
     raw::{RawConfig, RawRunHistoryConfig, RawTarget, RawWatchConfig},
 };
@@ -190,9 +190,9 @@ fn convert_target(config_path: &Path, name: TargetName, raw: RawTarget) -> Confi
         .into_iter()
         .map(|entry| resolve_relative_path(config_path, entry))
         .collect();
-    let watch_preference = extract_watch_preference(&name, &extra)?;
+    let refresh_watch_type = extract_refresh_watch_type(&name, &extra)?;
     let mut properties = extra;
-    properties.remove("watch_type");
+    properties.remove("refresh_watch_type");
     Ok(Target::Unit(UnitTarget {
         name,
         driver_type: target_type,
@@ -201,7 +201,7 @@ fn convert_target(config_path: &Path, name: TargetName, raw: RawTarget) -> Confi
         ports,
         properties,
         watch_paths,
-        watch_preference,
+        refresh_watch_type,
     }))
 }
 
@@ -243,26 +243,26 @@ fn convert_env_values(
     Ok(result)
 }
 
-fn extract_watch_preference(
+fn extract_refresh_watch_type(
     target_name: &str,
     properties: &BTreeMap<String, toml::Value>,
-) -> ConfigResult<WatchPreference> {
-    let Some(value) = properties.get("watch_type") else {
-        return Ok(WatchPreference::default());
+) -> ConfigResult<RefreshWatchType> {
+    let Some(value) = properties.get("refresh_watch_type") else {
+        return Ok(RefreshWatchType::default());
     };
     let Some(text) = value.as_str() else {
-        return Err(ConfigError::UnknownWatchType {
+        return Err(ConfigError::UnknownRefreshWatchType {
             target: target_name.to_string(),
             value: value.to_string(),
         });
     };
 
     match text.to_ascii_uppercase().as_str() {
-        "RUFA" | "RUNFA" => Ok(WatchPreference::Rufa),
+        "RUFA" | "RUNFA" => Ok(RefreshWatchType::Rufa),
         "PREFER_RUNTIME_SUPPLIED" | "RUNTIME" | "RUNTIME_SUPPLIED" => {
-            Ok(WatchPreference::PreferRuntimeSupplied)
+            Ok(RefreshWatchType::PreferRuntimeSupplied)
         }
-        _ => Err(ConfigError::UnknownWatchType {
+        _ => Err(ConfigError::UnknownRefreshWatchType {
             target: target_name.to_string(),
             value: text.to_string(),
         }),
@@ -642,8 +642,8 @@ port.metrics.fixed = 9100
                 .any(|path| path.ends_with("modules/shared"))
         );
         assert_eq!(
-            prg1.watch_preference,
-            WatchPreference::PreferRuntimeSupplied
+            prg1.refresh_watch_type,
+            RefreshWatchType::PreferRuntimeSupplied
         );
         let http_port = prg1.ports.get("http").expect("http port");
         assert_eq!(http_port.protocol, PortProtocol::Http);
@@ -733,13 +733,13 @@ env.BAD = "{missing}"
     }
 
     #[test]
-    fn parses_watch_preference() {
+    fn parses_refresh_watch_type() {
         let toml = r#"
 [target.service]
 type = "bun"
 kind = "service"
 script = "bun run start"
-watch_type = "RUFA"
+refresh_watch_type = "RUFA"
 "#;
 
         let config = load_from_str(fixture_path(), toml).expect("config parsed");
@@ -747,23 +747,23 @@ watch_type = "RUFA"
             Target::Unit(unit) => unit,
             _ => panic!("expected unit target"),
         };
-        assert_eq!(unit.watch_preference, WatchPreference::Rufa);
+        assert_eq!(unit.refresh_watch_type, RefreshWatchType::Rufa);
     }
 
     #[test]
-    fn rejects_unknown_watch_preference() {
+    fn rejects_unknown_refresh_watch_type() {
         let toml = r#"
 [target.service]
 type = "bun"
 kind = "service"
 script = "bun run start"
-watch_type = "INVALID"
+refresh_watch_type = "INVALID"
 "#;
 
         let err = load_from_str(fixture_path(), toml).unwrap_err();
         match err {
-            ConfigError::UnknownWatchType { .. } => {}
-            _ => panic!("expected UnknownWatchType"),
+            ConfigError::UnknownRefreshWatchType { .. } => {}
+            _ => panic!("expected UnknownRefreshWatchType"),
         }
     }
 }

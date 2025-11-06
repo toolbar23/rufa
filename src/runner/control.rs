@@ -143,7 +143,6 @@ pub struct TargetStatus {
 pub struct TargetControl {
     pub desired_state: DesiredState,
     pub action_plan: Action,
-    pub watch_request: bool,
     pub kind: TargetKind,
 }
 
@@ -152,13 +151,8 @@ impl TargetControl {
         Self {
             desired_state: DesiredState::Stopped,
             action_plan: Action::default(),
-            watch_request: false,
             kind: TargetKind::Unknown,
         }
-    }
-
-    pub fn set_watch_request(&mut self, watch: bool) {
-        self.watch_request = watch;
     }
 
     pub fn request_desired_state(&mut self, desired: DesiredState) {

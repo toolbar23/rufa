@@ -33,8 +33,8 @@ use tokio::{
 
 use crate::{
     config::{
-        self, Config, EnvValue, ReferenceResource, Target, TargetBehavior, TargetName, UnitTarget,
-        WatchPreference,
+        self, Config, EnvValue, ReferenceResource, RefreshWatchType, Target, TargetBehavior,
+        TargetName, UnitTarget,
     },
     debug_update::DebugUpdateContext,
     env,
@@ -52,6 +52,7 @@ pub struct Runner {
     config_path: PathBuf,
     logger: Arc<EventLogger>,
     state: Arc<RwLock<RuntimeState>>,
+    refresh_on_change: Arc<AtomicBool>,
     port_allocator: Arc<Mutex<PortAllocator>>,
     processes: Arc<RwLock<HashMap<String, Arc<ProcessHandle>>>>,
     port_sentries: Arc<RwLock<HashMap<String, PortSentrySet>>>,
@@ -98,6 +99,7 @@ impl Runner {
         config_path: impl Into<PathBuf>,
         logger: Arc<EventLogger>,
         state: Arc<RwLock<RuntimeState>>,
+        refresh_on_change: Arc<AtomicBool>,
         history_keep: usize,
         env_override_path: Option<PathBuf>,
     ) -> Result<Self> {
@@ -107,6 +109,7 @@ impl Runner {
             config_path: config_path.into(),
             logger,
             state,
+            refresh_on_change,
             port_allocator: Arc::new(Mutex::new(PortAllocator::default())),
             processes: Arc::new(RwLock::new(HashMap::new())),
             port_sentries: Arc::new(RwLock::new(HashMap::new())),
@@ -186,14 +189,6 @@ impl Runner {
             .entry(target.to_string())
             .or_insert_with(TargetControl::new);
         entry.action_plan = plan;
-    }
-
-    async fn set_watch_request(&self, target: &str, watch: bool) {
-        let mut guard = self.controls.write().await;
-        let entry = guard
-            .entry(target.to_string())
-            .or_insert_with(TargetControl::new);
-        entry.set_watch_request(watch);
     }
 
     async fn set_target_kind(&self, target: &str, kind: TargetKind) {
@@ -285,24 +280,15 @@ impl Runner {
             Action::Start {
                 on_success,
                 on_failure,
-            } => {
-                let watch_requested = {
-                    let guard = self.controls.read().await;
-                    guard
-                        .get(&target)
-                        .map(|ctrl| ctrl.watch_request)
-                        .unwrap_or(false)
-                };
-                match self.start_targets(&[target.clone()], watch_requested).await {
-                    Ok(_) => {
-                        self.replace_action_plan(&target, *on_success).await;
-                    }
-                    Err(error) => {
-                        tracing::error!(%error, target = %target, "start action failed");
-                        self.replace_action_plan(&target, *on_failure).await;
-                    }
+            } => match self.start_targets(&[target.clone()]).await {
+                Ok(_) => {
+                    self.replace_action_plan(&target, *on_success).await;
                 }
-            }
+                Err(error) => {
+                    tracing::error!(%error, target = %target, "start action failed");
+                    self.replace_action_plan(&target, *on_failure).await;
+                }
+            },
             Action::Stop {
                 on_success,
                 on_failure,
@@ -350,7 +336,7 @@ impl Runner {
         self.watch_spec_from_config(&config, targets)
     }
 
-    pub async fn request_start(&self, targets: &[String], watch: bool) -> Result<StartOutcome> {
+    pub async fn request_start(&self, targets: &[String]) -> Result<StartOutcome> {
         let config = config::load_from_path(&self.config_path).with_context(|| {
             format!(
                 "loading configuration from {:?}",
@@ -363,15 +349,9 @@ impl Runner {
             bail!("no runnable targets resolved from selection");
         }
 
-        let state_snapshot = {
-            let guard = self.state.read().await;
-            guard.clone()
-        };
-
         let mut rufa_watch_targets = Vec::new();
         for unit in &units {
             let name = unit.name.clone();
-            self.set_watch_request(&name, watch).await;
             self.set_desired_state_for(&name, DesiredState::Running)
                 .await;
             let kind = match &unit.behavior {
@@ -381,13 +361,7 @@ impl Runner {
             self.set_target_kind(&name, kind).await;
 
             if matches!(&unit.behavior, TargetBehavior::Service) {
-                let previous = state_snapshot.targets.get(&name);
-                let wants_rufa_watch = if watch {
-                    matches!(unit.watch_preference, WatchPreference::Rufa)
-                } else {
-                    previous.map(|state| state.rufa_watch).unwrap_or(false)
-                };
-                if wants_rufa_watch {
+                if matches!(unit.refresh_watch_type, RefreshWatchType::Rufa) {
                     rufa_watch_targets.push(name);
                 }
             }
@@ -409,7 +383,6 @@ impl Runner {
         };
 
         for target in targets {
-            self.set_watch_request(&target, false).await;
             self.set_desired_state_for(&target, DesiredState::Stopped)
                 .await;
         }
@@ -452,17 +425,9 @@ impl Runner {
             }
         }
 
-        let state_snapshot = self.state.read().await.clone();
-        let watch_requested = state_snapshot
-            .targets
-            .iter()
-            .filter(|(name, _)| unit_names.contains(name))
-            .any(|(_, state)| state.rufa_watch || state.runtime_watch);
-
         let mut rufa_watch_targets = Vec::new();
         for unit in &units {
             let name = unit.name.clone();
-            self.set_watch_request(&name, watch_requested).await;
             self.set_desired_state_for(&name, DesiredState::Restarted)
                 .await;
             let kind = match &unit.behavior {
@@ -471,16 +436,10 @@ impl Runner {
             };
             self.set_target_kind(&name, kind).await;
 
-            if matches!(&unit.behavior, TargetBehavior::Service) {
-                let previous = state_snapshot.targets.get(&name);
-                let wants_rufa_watch = if watch_requested {
-                    matches!(unit.watch_preference, WatchPreference::Rufa)
-                } else {
-                    previous.map(|state| state.rufa_watch).unwrap_or(false)
-                };
-                if wants_rufa_watch {
-                    rufa_watch_targets.push(name);
-                }
+            if matches!(&unit.behavior, TargetBehavior::Service)
+                && matches!(unit.refresh_watch_type, RefreshWatchType::Rufa)
+            {
+                rufa_watch_targets.push(name);
             }
         }
 
@@ -491,6 +450,95 @@ impl Runner {
         };
 
         Ok(StartOutcome { rufa_watch })
+    }
+
+    pub async fn restart_stale_targets(&self) -> Result<(Vec<String>, StartOutcome)> {
+        let stale = {
+            let mut state_guard = self.state.write().await;
+            state_guard
+                .targets
+                .iter_mut()
+                .filter_map(|(name, entry)| {
+                    if entry.change_noticed_restart_necessary && entry.pid.is_some() {
+                        entry.change_noticed_restart_necessary = false;
+                        Some(name.clone())
+                    } else {
+                        None
+                    }
+                })
+                .collect::<Vec<_>>()
+        };
+
+        if stale.is_empty() {
+            return Ok((Vec::new(), StartOutcome::default()));
+        }
+
+        let outcome = self.request_restart(&stale, false).await?;
+        Ok((stale, outcome))
+    }
+
+    pub async fn restart_runtime_refresh_targets(&self) -> Result<(Vec<String>, StartOutcome)> {
+        let running_targets = {
+            let processes = self.processes.read().await;
+            processes.keys().cloned().collect::<Vec<_>>()
+        };
+
+        if running_targets.is_empty() {
+            return Ok((Vec::new(), StartOutcome::default()));
+        }
+
+        let config = config::load_from_path(&self.config_path).with_context(|| {
+            format!(
+                "loading configuration from {:?}",
+                self.config_path.as_os_str()
+            )
+        })?;
+
+        let runtime_targets: Vec<String> = running_targets
+            .into_iter()
+            .filter(|name| {
+                matches!(
+                    config.targets.get(name),
+                    Some(Target::Unit(unit))
+                        if matches!(unit.behavior, TargetBehavior::Service)
+                            && matches!(
+                                unit.refresh_watch_type,
+                                RefreshWatchType::PreferRuntimeSupplied
+                            )
+                )
+            })
+            .collect();
+
+        if runtime_targets.is_empty() {
+            return Ok((Vec::new(), StartOutcome::default()));
+        }
+
+        let units = resolve_units(&config, &runtime_targets)?;
+        let mut rufa_watch_targets = Vec::new();
+        for unit in &units {
+            let name = unit.name.clone();
+            self.set_desired_state_for(&name, DesiredState::Restarted)
+                .await;
+            let kind = match &unit.behavior {
+                TargetBehavior::Service => TargetKind::Service,
+                TargetBehavior::Job { .. } => TargetKind::Job,
+            };
+            self.set_target_kind(&name, kind).await;
+
+            if matches!(&unit.behavior, TargetBehavior::Service)
+                && matches!(unit.refresh_watch_type, RefreshWatchType::Rufa)
+            {
+                rufa_watch_targets.push(name);
+            }
+        }
+
+        let rufa_watch = if rufa_watch_targets.is_empty() {
+            None
+        } else {
+            Some(self.watch_spec_from_config(&config, &rufa_watch_targets)?)
+        };
+
+        Ok((runtime_targets, StartOutcome { rufa_watch }))
     }
 
     pub async fn request_restart_from_watch(&self, target: &str) -> bool {
@@ -508,16 +556,22 @@ impl Runner {
             return false;
         }
 
-        let watch_assignment = {
-            let state_guard = self.state.read().await;
-            state_guard
-                .targets
-                .get(target)
-                .map(|entry| (entry.runtime_watch, entry.rufa_watch))
-        };
+        let refresh_enabled = self.refresh_on_change.load(Ordering::SeqCst);
 
-        let Some((runtime_watch, rufa_watch)) = watch_assignment else {
-            return false;
+        let (runtime_watch, rufa_watch) = {
+            let mut state_guard = self.state.write().await;
+            let Some(entry) = state_guard.targets.get_mut(target) else {
+                return false;
+            };
+            if !entry.rufa_watch {
+                return false;
+            }
+            if !refresh_enabled {
+                entry.change_noticed_restart_necessary = true;
+                return false;
+            }
+            entry.change_noticed_restart_necessary = false;
+            (entry.runtime_watch, entry.rufa_watch)
         };
 
         if runtime_watch || !rufa_watch {
@@ -573,7 +627,7 @@ impl Runner {
         })
     }
 
-    pub async fn start_targets(&self, targets: &[String], watch: bool) -> Result<StartOutcome> {
+    pub async fn start_targets(&self, targets: &[String]) -> Result<StartOutcome> {
         let config = config::load_from_path(&self.config_path).with_context(|| {
             format!(
                 "loading configuration from {:?}",
@@ -586,15 +640,10 @@ impl Runner {
             bail!("no runnable targets resolved from selection");
         }
 
-        self.start_units(&config, units, watch).await
+        self.start_units(&config, units).await
     }
 
-    async fn start_units(
-        &self,
-        config: &Config,
-        units: Vec<UnitTarget>,
-        watch: bool,
-    ) -> Result<StartOutcome> {
+    async fn start_units(&self, config: &Config, units: Vec<UnitTarget>) -> Result<StartOutcome> {
         {
             let processes = self.processes.read().await;
             for unit in &units {
@@ -656,34 +705,22 @@ impl Runner {
 
         let mut rufa_watch_targets = Vec::new();
 
+        let refresh_on_change = self.refresh_on_change.load(Ordering::SeqCst);
+
         for unit in units {
             let ports = assignments.get(&unit.name).cloned().unwrap_or_default();
 
             let generation = self.next_generation(&unit.name).await?;
 
-            let previous = state_snapshot.targets.get(&unit.name);
-            let runtime_watch_allowed = matches!(unit.behavior, TargetBehavior::Service);
-            let wants_runtime_watch = if runtime_watch_allowed {
-                if watch {
-                    matches!(
-                        unit.watch_preference,
-                        WatchPreference::PreferRuntimeSupplied
-                    )
-                } else {
-                    previous.map(|state| state.runtime_watch).unwrap_or(false)
-                }
-            } else {
-                false
-            };
-            let wants_rufa_watch = if matches!(unit.behavior, TargetBehavior::Service) {
-                if watch {
-                    matches!(unit.watch_preference, WatchPreference::Rufa)
-                } else {
-                    previous.map(|state| state.rufa_watch).unwrap_or(false)
-                }
-            } else {
-                false
-            };
+            let is_service = matches!(unit.behavior, TargetBehavior::Service);
+            let wants_runtime_watch = is_service
+                && matches!(
+                    unit.refresh_watch_type,
+                    RefreshWatchType::PreferRuntimeSupplied
+                )
+                && refresh_on_change;
+            let wants_rufa_watch =
+                is_service && matches!(unit.refresh_watch_type, RefreshWatchType::Rufa);
             if wants_rufa_watch {
                 rufa_watch_targets.push(unit.name.clone());
             }
@@ -1027,7 +1064,6 @@ impl Runner {
 
     pub async fn stop_targets(&self, targets: &[String]) -> Result<()> {
         for target in targets {
-            self.set_watch_request(target, false).await;
             self.set_desired_state_for(target, DesiredState::Stopped)
                 .await;
             self.terminate_target(target).await?;
@@ -1074,6 +1110,7 @@ impl Runner {
             if let Some(entry) = state_guard.targets.get_mut(target) {
                 entry.runtime_watch = false;
                 entry.rufa_watch = false;
+                entry.change_noticed_restart_necessary = false;
             }
         }
 

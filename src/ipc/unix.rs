@@ -19,15 +19,15 @@ use tokio::{
     time::sleep,
 };
 
-use crate::config::{self, Config, Target, TargetBehavior, WatchPreference};
+use crate::config::{self, Config, RefreshWatchType, Target, TargetBehavior};
 use crate::ipc::{
-    AvailableTargetSummary, BehaviorKind, ConfigureRequest, ControlStateSummary, ExitDetails,
-    InfoRequest, InfoResponse, LockInfo, LogRequest, PortSummary, RestartRequest,
-    StartTargetsRequest, StopTargetsRequest, lock,
+    AvailableTargetSummary, BehaviorKind, ControlStateSummary, ExitDetails, InfoRequest,
+    InfoResponse, LockInfo, LogRequest, PortSummary, RestartRequest, StartTargetsRequest,
+    StopTargetsRequest, lock,
     protocol::{
-        ClientCommand, RunHistorySummary, RunningTargetSummary, ServerResponse,
-        StoppedTargetSummary, TargetConfigSummary, TargetGenerationSummary, TargetRunState,
-        WatchPreferenceKind,
+        ClientCommand, RefreshCommand, RefreshMode, RefreshWatchTypeKind, RunHistorySummary,
+        RunningTargetSummary, ServerResponse, StoppedTargetSummary, TargetConfigSummary,
+        TargetGenerationSummary, TargetRunState,
     },
 };
 use crate::logging::EventLogger;
@@ -65,8 +65,8 @@ impl IpcClient {
         self.send(ClientCommand::StopTargets(request)).await
     }
 
-    pub async fn configure(&self, request: ConfigureRequest) -> Result<ServerResponse> {
-        self.send(ClientCommand::Configure(request)).await
+    pub async fn refresh(&self, command: RefreshCommand) -> Result<ServerResponse> {
+        self.send(ClientCommand::Refresh(command)).await
     }
 
     pub async fn info(&self, request: InfoRequest) -> Result<ServerResponse> {
@@ -91,7 +91,7 @@ impl IpcClient {
 struct ServerContext {
     runner: Arc<Runner>,
     watch: Arc<WatchManager>,
-    default_watch: Arc<AtomicBool>,
+    refresh_on_change: Arc<AtomicBool>,
 }
 
 pub async fn connect_existing_client() -> Result<Option<IpcClient>> {
@@ -121,7 +121,7 @@ pub async fn require_daemon_client() -> Result<IpcClient> {
         .ok_or_else(|| anyhow!("rufa daemon is not running; launch it with `rufa start`"))
 }
 
-pub async fn spawn_daemon_process(default_watch: bool, env_file: Option<&Path>) -> Result<()> {
+pub async fn spawn_daemon_process(refresh_on_change: bool, env_file: Option<&Path>) -> Result<()> {
     // Clean up any existing lock/socket artifacts before spawning.
     if let Some(lock_info) = lock::read_lock().ok().flatten() {
         let _ = cleanup_stale(&lock_info);
@@ -132,7 +132,10 @@ pub async fn spawn_daemon_process(default_watch: bool, env_file: Option<&Path>) 
 
     let mut command = std::process::Command::new(current_exe);
     command.arg("__daemon");
-    command.env("RUFA_DEFAULT_WATCH", if default_watch { "1" } else { "0" });
+    command.env(
+        "RUFA_REFRESH_TARGET_ON_CHANGE",
+        if refresh_on_change { "1" } else { "0" },
+    );
     match env_file {
         Some(path) => {
             command.env(crate::env::OVERRIDE_ENV_FILE_VAR, path);
@@ -194,7 +197,7 @@ async fn run_daemon_internal() -> Result<()> {
     let listener = UnixListener::bind(&socket_path)
         .with_context(|| format!("binding IPC socket at {:?}", socket_path))?;
 
-    let default_watch = match std::env::var("RUFA_DEFAULT_WATCH") {
+    let refresh_on_change = match std::env::var("RUFA_REFRESH_TARGET_ON_CHANGE") {
         Ok(value) => matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"),
         Err(_) => false,
     };
@@ -202,7 +205,7 @@ async fn run_daemon_internal() -> Result<()> {
     let lock_info = LockInfo {
         pid: process::id(),
         socket_path: socket_path.to_string_lossy().into_owned(),
-        default_watch,
+        refresh_target_on_change: refresh_on_change,
     };
     lock::write_lock(&lock_info).context("writing .rufa.lock")?;
 
@@ -217,12 +220,16 @@ async fn run_daemon_internal() -> Result<()> {
     let config_path = PathBuf::from("rufa.toml");
     let env_override_path = std::env::var_os(crate::env::OVERRIDE_ENV_FILE_VAR).map(PathBuf::from);
     let watch = Arc::new(WatchManager::new());
-    let default_watch_flag = Arc::new(AtomicBool::new(default_watch));
+    let refresh_on_change_flag = Arc::new(AtomicBool::new(refresh_on_change));
     let context = Arc::new(ServerContext {
-        runner: initialize_runner(&config_path, env_override_path)
-            .context("initializing runner")?,
+        runner: initialize_runner(
+            &config_path,
+            env_override_path,
+            refresh_on_change_flag.clone(),
+        )
+        .context("initializing runner")?,
         watch,
-        default_watch: default_watch_flag,
+        refresh_on_change: refresh_on_change_flag,
     });
 
     loop {
@@ -300,15 +307,15 @@ async fn handle_connection(stream: UnixStream, context: Arc<ServerContext>) -> R
     let response = match command {
         ClientCommand::Ping => ServerResponse::Ack,
         ClientCommand::StartTargets(request) => {
-            let watch = context.default_watch.load(Ordering::SeqCst);
+            let refresh = context.refresh_on_change.load(Ordering::SeqCst);
 
             tracing::info!(
                 targets = ?request.targets,
-                watch,
+                refresh_on_change = refresh,
                 "received start request"
             );
 
-            match context.runner.request_start(&request.targets, watch).await {
+            match context.runner.request_start(&request.targets).await {
                 Ok(outcome) => {
                     if let Some(spec) = outcome.rufa_watch {
                         if let Err(error) = context
@@ -319,8 +326,6 @@ async fn handle_connection(stream: UnixStream, context: Arc<ServerContext>) -> R
                             tracing::error!(%error, "failed to enable watch mode");
                             return Ok(false);
                         }
-                    } else {
-                        context.watch.disable().await;
                     }
                     ServerResponse::Ack
                 }
@@ -362,6 +367,7 @@ async fn handle_connection(stream: UnixStream, context: Arc<ServerContext>) -> R
                 .map(|(name, generation)| TargetGenerationSummary { name, generation })
                 .collect();
             let response = InfoResponse {
+                refresh_target_on_change_enabled: context.refresh_on_change.load(Ordering::SeqCst),
                 running: running_summaries,
                 stopped: stopped_summaries,
                 available,
@@ -396,8 +402,6 @@ async fn handle_connection(stream: UnixStream, context: Arc<ServerContext>) -> R
                         {
                             tracing::error!(%error, "failed to enable watch mode after restart");
                         }
-                    } else {
-                        context.watch.disable().await;
                     }
                     ServerResponse::Ack
                 }
@@ -421,15 +425,94 @@ async fn handle_connection(stream: UnixStream, context: Arc<ServerContext>) -> R
                 }
             }
         }
-        ClientCommand::Configure(request) => {
-            if let Some(value) = request.default_watch {
-                context.default_watch.store(value, Ordering::SeqCst);
-                if let Err(error) = lock::update_default_watch(value) {
-                    tracing::warn!(%error, "failed to update lock with new default watch setting");
+        ClientCommand::Refresh(command) => match command {
+            RefreshCommand::Set { mode } => {
+                let enabled = matches!(mode, RefreshMode::Auto);
+                let previous = context.refresh_on_change.swap(enabled, Ordering::SeqCst);
+                if previous != enabled {
+                    if let Err(error) = lock::update_refresh_target_on_change(enabled) {
+                        tracing::warn!(
+                            %error,
+                            "failed to update lock with new refresh-on-change setting"
+                        );
+                    }
+                    tracing::info!(
+                        refresh_on_change = enabled,
+                        "refresh setting updated; evaluating runtime targets"
+                    );
+                    match context.runner.restart_runtime_refresh_targets().await {
+                        Ok((targets, outcome)) => {
+                            if !targets.is_empty() {
+                                tracing::info!(
+                                    targets = ?targets,
+                                    "queued runtime target restarts after refresh setting change"
+                                );
+                            }
+                            if let Some(spec) = outcome.rufa_watch {
+                                if let Err(error) = context
+                                    .watch
+                                    .enable_watch(context.runner.clone(), spec)
+                                    .await
+                                {
+                                    tracing::error!(
+                                        %error,
+                                        "failed to enable watch mode after refresh setting change"
+                                    );
+                                }
+                            }
+                            ServerResponse::Ack
+                        }
+                        Err(error) => {
+                            tracing::error!(
+                                %error,
+                                "failed to restart runtime targets after refresh setting change"
+                            );
+                            ServerResponse::Error(error.to_string())
+                        }
+                    }
+                } else {
+                    tracing::info!(
+                        refresh_on_change = enabled,
+                        "refresh setting unchanged; skipping runtime restart"
+                    );
+                    ServerResponse::Ack
                 }
             }
-            ServerResponse::Ack
-        }
+            RefreshCommand::RestartStaleTargets => {
+                match context.runner.restart_stale_targets().await {
+                    Ok((targets, outcome)) => {
+                        if targets.is_empty() {
+                            tracing::info!("no targets flagged for refresh-triggered restart");
+                        } else {
+                            tracing::info!(
+                                targets = ?targets,
+                                "queued restart for stale refresh targets"
+                            );
+                        }
+                        if let Some(spec) = outcome.rufa_watch {
+                            if let Err(error) = context
+                                .watch
+                                .enable_watch(context.runner.clone(), spec)
+                                .await
+                            {
+                                tracing::error!(
+                                    %error,
+                                    "failed to enable watch mode after refreshing stale targets"
+                                );
+                            }
+                        }
+                        ServerResponse::Ack
+                    }
+                    Err(error) => {
+                        tracing::error!(
+                            %error,
+                            "failed to restart stale refresh targets"
+                        );
+                        ServerResponse::Error(error.to_string())
+                    }
+                }
+            }
+        },
         ClientCommand::Stop => {
             tracing::info!("received stop request");
             let stop_targets = context.runner.stop_all().await;
@@ -505,7 +588,7 @@ async fn gather_running_targets(
 
         let config_summary = TargetConfigSummary {
             driver: unit.driver_type.clone(),
-            watch: watch_preference_kind(unit.watch_preference),
+            refresh_watch_type: refresh_watch_type_kind(unit.refresh_watch_type),
             watch_paths: unit
                 .watch_paths
                 .iter()
@@ -519,6 +602,7 @@ async fn gather_running_targets(
             ports: build_port_summaries(unit, &target_state.ports),
             last_log: target_state.last_log_line.clone(),
             last_exit: target_state.last_exit.as_ref().map(exit_details_from_state),
+            refresh_pending: target_state.change_noticed_restart_necessary,
         };
 
         let history = target_state
@@ -597,7 +681,7 @@ async fn gather_stopped_targets(
 
         let config_summary = TargetConfigSummary {
             driver: unit.driver_type.clone(),
-            watch: watch_preference_kind(unit.watch_preference),
+            refresh_watch_type: refresh_watch_type_kind(unit.refresh_watch_type),
             watch_paths: unit
                 .watch_paths
                 .iter()
@@ -719,10 +803,10 @@ fn build_port_summaries(
     summaries
 }
 
-fn watch_preference_kind(preference: WatchPreference) -> WatchPreferenceKind {
+fn refresh_watch_type_kind(preference: RefreshWatchType) -> RefreshWatchTypeKind {
     match preference {
-        WatchPreference::Rufa => WatchPreferenceKind::Rufa,
-        WatchPreference::PreferRuntimeSupplied => WatchPreferenceKind::Runtime,
+        RefreshWatchType::Rufa => RefreshWatchTypeKind::Rufa,
+        RefreshWatchType::PreferRuntimeSupplied => RefreshWatchTypeKind::Runtime,
     }
 }
 
@@ -746,6 +830,7 @@ fn exit_details_from_state(exit: &ExitStatus) -> ExitDetails {
 fn initialize_runner(
     config_path: &Path,
     env_override_path: Option<PathBuf>,
+    refresh_on_change: Arc<AtomicBool>,
 ) -> Result<Arc<Runner>> {
     let (log_config, history_keep) = match config::load_from_path(config_path) {
         Ok(cfg) => (cfg.log, cfg.run_history.keep_runs),
@@ -764,6 +849,7 @@ fn initialize_runner(
         config_path.to_path_buf(),
         logger,
         state,
+        refresh_on_change,
         history_keep,
         env_override_path,
     )?;

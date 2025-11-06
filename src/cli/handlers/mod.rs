@@ -2,9 +2,9 @@ use super::log_io;
 use super::*;
 use crate::env::OVERRIDE_ENV_FILE_VAR;
 use crate::ipc::{
-    BehaviorKind, ConfigureRequest, InfoRequest, InfoResponse, RestartRequest, RunHistorySummary,
-    RunningTargetSummary, ServerResponse, StartTargetsRequest, StopTargetsRequest,
-    StoppedTargetSummary, TargetConfigSummary, TargetRunState, WatchPreferenceKind,
+    BehaviorKind, InfoRequest, InfoResponse, RefreshCommand, RefreshMode, RefreshWatchTypeKind,
+    RestartRequest, RunHistorySummary, RunningTargetSummary, ServerResponse, StartTargetsRequest,
+    StopTargetsRequest, StoppedTargetSummary, TargetConfigSummary, TargetRunState,
     connect_existing_client, require_daemon_client, run_daemon, spawn_daemon_process,
     wait_for_daemon_ready, wait_for_shutdown,
 };
@@ -32,15 +32,53 @@ pub async fn init(_args: InitArgs) -> Result<()> {
     Ok(())
 }
 
+pub async fn refresh(command: RefreshCliCommand) -> Result<()> {
+    let client = require_daemon_client().await?;
+    match command {
+        RefreshCliCommand::Set(args) => {
+            let mode = match args.mode {
+                RefreshModeArg::Auto => RefreshMode::Auto,
+                RefreshModeArg::Off => RefreshMode::Off,
+            };
+            match client
+                .refresh(RefreshCommand::Set { mode })
+                .await
+                .context("failed to update refresh setting")?
+            {
+                ServerResponse::Ack => {
+                    println!(
+                        "refresh on change set to {}",
+                        match mode {
+                            RefreshMode::Auto => "auto",
+                            RefreshMode::Off => "off",
+                        }
+                    );
+                    Ok(())
+                }
+                ServerResponse::Info(_) => Ok(()),
+                ServerResponse::Error(message) => bail!(message),
+            }
+        }
+        RefreshCliCommand::StaleTargets => match client
+            .refresh(RefreshCommand::RestartStaleTargets)
+            .await
+            .context("failed to refresh stale targets")?
+        {
+            ServerResponse::Ack => {
+                println!("requested restart for stale refresh targets");
+                Ok(())
+            }
+            ServerResponse::Info(_) => Ok(()),
+            ServerResponse::Error(message) => bail!(message),
+        },
+    }
+}
+
 pub async fn start_daemon(args: DaemonStartArgs) -> Result<()> {
     let DaemonStartArgs {
-        watch,
-        no_watch,
         foreground,
         env_file,
     } = args;
-
-    let watch_setting = watch_setting_from_flags(watch, no_watch);
 
     let env_file_path = if let Some(path) = env_file {
         let resolved = if path.is_absolute() {
@@ -67,10 +105,6 @@ pub async fn start_daemon(args: DaemonStartArgs) -> Result<()> {
             return Ok(());
         }
 
-        let default_watch = watch_setting.unwrap_or(false);
-        unsafe {
-            std::env::set_var("RUFA_DEFAULT_WATCH", if default_watch { "1" } else { "0" });
-        }
         match env_file_path.as_ref() {
             Some(path) => unsafe { std::env::set_var(OVERRIDE_ENV_FILE_VAR, path) },
             None => unsafe { std::env::remove_var(OVERRIDE_ENV_FILE_VAR) },
@@ -81,39 +115,16 @@ pub async fn start_daemon(args: DaemonStartArgs) -> Result<()> {
 
         let result = run_daemon().await;
         unsafe {
-            std::env::remove_var("RUFA_DEFAULT_WATCH");
-        }
-        unsafe {
             std::env::remove_var(OVERRIDE_ENV_FILE_VAR);
         }
         return result;
     }
 
-    if let Some(client) = existing {
-        if let Some(value) = watch_setting {
-            match client
-                .configure(ConfigureRequest {
-                    default_watch: Some(value),
-                })
-                .await?
-            {
-                ServerResponse::Ack => {
-                    println!(
-                        "updated default watch setting to {} on running daemon",
-                        if value { "enabled" } else { "disabled" }
-                    );
-                    Ok(())
-                }
-                ServerResponse::Info(_) => Ok(()),
-                ServerResponse::Error(message) => bail!(message),
-            }
-        } else {
-            println!("rufa daemon already running; use `rufa stop` to restart it if needed");
-            Ok(())
-        }
+    if existing.is_some() {
+        println!("rufa daemon already running; use `rufa stop` to restart it if needed");
+        Ok(())
     } else {
-        let spawn_result =
-            spawn_daemon_process(watch_setting.unwrap_or(false), env_file_path.as_deref()).await;
+        let spawn_result = spawn_daemon_process(false, env_file_path.as_deref()).await;
         if let Err(error) = spawn_result {
             return Err(error).context("failed to spawn rufa daemon");
         }
@@ -452,6 +463,16 @@ fn write_info_response<W: Write>(
 ) -> io::Result<()> {
     let terminal_width = detect_terminal_width();
     let colorize = std::io::stdout().is_terminal();
+    writeln!(
+        writer,
+        "Refresh on change: {}",
+        if data.refresh_target_on_change_enabled {
+            "auto"
+        } else {
+            "off"
+        }
+    )?;
+    writeln!(writer)?;
     writeln!(writer, "Running targets:")?;
     if data.running.is_empty() {
         writeln!(writer, "  - none")?;
@@ -611,8 +632,8 @@ fn write_config_details<W: Write>(writer: &mut W, config: &TargetConfigSummary) 
     writeln!(writer, "        driver: {}", config.driver)?;
     writeln!(
         writer,
-        "        watch: {}",
-        watch_preference_label(config.watch)
+        "        refresh watch type: {}",
+        refresh_watch_type_label(config.refresh_watch_type)
     )?;
     if config.watch_paths.is_empty() {
         writeln!(writer, "        watch paths: (default)")?;
@@ -646,6 +667,11 @@ fn write_run_state<W: Write>(
             writeln!(writer, "{indent}  {}", format_port_summary(port))?;
         }
     }
+    writeln!(
+        writer,
+        "{indent}refresh pending: {}",
+        if state.refresh_pending { "yes" } else { "no" }
+    )?;
     write_last_logs(
         writer,
         target_name,
@@ -791,10 +817,10 @@ fn detect_terminal_width() -> Option<usize> {
     }
 }
 
-fn watch_preference_label(kind: WatchPreferenceKind) -> &'static str {
+fn refresh_watch_type_label(kind: RefreshWatchTypeKind) -> &'static str {
     match kind {
-        WatchPreferenceKind::Rufa => "rufa",
-        WatchPreferenceKind::Runtime => "runtime",
+        RefreshWatchTypeKind::Rufa => "rufa",
+        RefreshWatchTypeKind::Runtime => "runtime",
     }
 }
 
@@ -802,14 +828,6 @@ fn behavior_label(kind: BehaviorKind) -> &'static str {
     match kind {
         BehaviorKind::Service => "service",
         BehaviorKind::Job => "job",
-    }
-}
-
-fn watch_setting_from_flags(watch: bool, no_watch: bool) -> Option<bool> {
-    match (watch, no_watch) {
-        (true, false) => Some(true),
-        (false, true) => Some(false),
-        _ => None,
     }
 }
 

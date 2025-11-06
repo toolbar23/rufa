@@ -100,7 +100,7 @@ pub struct UnitTarget {
     pub ports: BTreeMap<String, PortDefinition>,
     pub properties: BTreeMap<String, Value>,
     pub watch_paths: Vec<PathBuf>,
-    pub watch_preference: WatchPreference,
+    pub refresh_watch_type: RefreshWatchType,
 }
 
 #[derive(Debug, Clone)]
@@ -181,13 +181,13 @@ impl PortSelection {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum WatchPreference {
+pub enum RefreshWatchType {
     Rufa,
     PreferRuntimeSupplied,
 }
 
-impl Default for WatchPreference {
+impl Default for RefreshWatchType {
     fn default() -> Self {
-        WatchPreference::PreferRuntimeSupplied
+        RefreshWatchType::PreferRuntimeSupplied
     }
 }

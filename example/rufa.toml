@@ -25,7 +25,7 @@ kind = "service"
 module = "panda-core"
 # Only restart when these paths change; defaults to entire workspace.
 watch = ["modules/panda-core/src", "modules/shared"]
-watch_type = "RUFA"
+refresh_watch_type = "RUFA"
 port.http.type = "http"
 port.http.auto_range = "8000-8100"
 port.debug.type = "tcp"

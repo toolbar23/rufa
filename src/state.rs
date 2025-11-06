@@ -26,6 +26,8 @@ pub struct TargetState {
     pub runtime_watch: bool,
     /// Whether rufa-managed watch mode is active for this target.
     pub rufa_watch: bool,
+    /// Whether a change was detected while refresh-on-change was disabled.
+    pub change_noticed_restart_necessary: bool,
     /// Historical run records (most recent first).
     pub history: VecDeque<RunRecord>,
 }
@@ -54,6 +56,7 @@ impl Default for TargetState {
             last_exit: None,
             runtime_watch: false,
             rufa_watch: false,
+            change_noticed_restart_necessary: false,
             history: VecDeque::new(),
         }
     }
@@ -90,5 +93,6 @@ impl TargetState {
         self.last_exit = None;
         self.runtime_watch = runtime_watch;
         self.rufa_watch = rufa_watch;
+        self.change_noticed_restart_necessary = false;
     }
 }

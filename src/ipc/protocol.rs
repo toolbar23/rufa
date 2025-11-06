@@ -5,7 +5,7 @@ pub enum ClientCommand {
     Ping,
     StartTargets(StartTargetsRequest),
     StopTargets(StopTargetsRequest),
-    Configure(ConfigureRequest),
+    Refresh(RefreshCommand),
     Info(InfoRequest),
     Log(LogRequest),
     Restart(RestartRequest),
@@ -23,8 +23,15 @@ pub struct StopTargetsRequest {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ConfigureRequest {
-    pub default_watch: Option<bool>,
+pub enum RefreshCommand {
+    Set { mode: RefreshMode },
+    RestartStaleTargets,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+pub enum RefreshMode {
+    Auto,
+    Off,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -61,6 +68,7 @@ pub enum ServerResponse {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct InfoResponse {
+    pub refresh_target_on_change_enabled: bool,
     pub running: Vec<RunningTargetSummary>,
     pub stopped: Vec<StoppedTargetSummary>,
     pub available: Vec<AvailableTargetSummary>,
@@ -96,12 +104,12 @@ pub struct AvailableTargetSummary {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TargetConfigSummary {
     pub driver: String,
-    pub watch: WatchPreferenceKind,
+    pub refresh_watch_type: RefreshWatchTypeKind,
     pub watch_paths: Vec<String>,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
-pub enum WatchPreferenceKind {
+pub enum RefreshWatchTypeKind {
     Rufa,
     Runtime,
 }
@@ -113,6 +121,7 @@ pub struct TargetRunState {
     pub ports: Vec<PortSummary>,
     pub last_log: Option<String>,
     pub last_exit: Option<ExitDetails>,
+    pub refresh_pending: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

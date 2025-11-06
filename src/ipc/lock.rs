@@ -12,7 +12,7 @@ pub struct LockInfo {
     pub pid: u32,
     pub socket_path: String,
     #[serde(default)]
-    pub default_watch: bool,
+    pub refresh_target_on_change: bool,
 }
 
 impl LockInfo {
@@ -82,9 +82,9 @@ pub fn remove_socket(path: &Path) -> io::Result<()> {
     Ok(())
 }
 
-pub fn update_default_watch(value: bool) -> io::Result<()> {
+pub fn update_refresh_target_on_change(value: bool) -> io::Result<()> {
     if let Some(mut info) = read_lock()? {
-        info.default_watch = value;
+        info.refresh_target_on_change = value;
         write_lock(&info)?;
     }
     Ok(())

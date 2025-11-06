@@ -3,10 +3,10 @@ mod protocol;
 
 pub use lock::{LockInfo, runtime_dir};
 pub use protocol::{
-    AvailableTargetSummary, BehaviorKind, ConfigureRequest, ControlStateSummary, ExitDetails,
-    InfoRequest, InfoResponse, LogRequest, PortSummary, RestartRequest, RunHistorySummary,
-    RunningTargetSummary, ServerResponse, StartTargetsRequest, StopTargetsRequest,
-    StoppedTargetSummary, TargetConfigSummary, TargetRunState, WatchPreferenceKind,
+    AvailableTargetSummary, BehaviorKind, ControlStateSummary, ExitDetails, InfoRequest,
+    InfoResponse, LogRequest, PortSummary, RefreshCommand, RefreshMode, RefreshWatchTypeKind,
+    RestartRequest, RunHistorySummary, RunningTargetSummary, ServerResponse, StartTargetsRequest,
+    StopTargetsRequest, StoppedTargetSummary, TargetConfigSummary, TargetRunState,
 };
 
 #[cfg(unix)]
@@ -24,7 +24,7 @@ mod unix {
 
     use anyhow::{Result, bail};
 
-    use super::protocol::ClientCommand;
+    use super::protocol::{ClientCommand, RefreshCommand};
     use super::{
         InfoRequest, LogRequest, RestartRequest, ServerResponse, StartTargetsRequest,
         StopTargetsRequest,
@@ -54,7 +54,7 @@ mod unix {
     }
 
     pub async fn spawn_daemon_process(
-        _default_watch: bool,
+        _refresh_on_change: bool,
         _env_file: Option<&std::path::Path>,
     ) -> Result<()> {
         bail!("IPC is not supported on this platform")
@@ -94,6 +94,10 @@ mod unix {
         }
 
         pub async fn stop(&self) -> Result<ServerResponse> {
+            bail!("IPC is not supported on this platform")
+        }
+
+        pub async fn refresh(&self, _command: RefreshCommand) -> Result<ServerResponse> {
             bail!("IPC is not supported on this platform")
         }
     }

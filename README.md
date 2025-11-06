@@ -78,12 +78,14 @@ Rufa ships with adapters for these target `type` values:
   * `port.<name>.fixed = PORT` – always use the given port number.
 
 ### Watch Paths
-- Services restart automatically in `--watch` mode when files change.
+- Services refresh automatically when files change if refresh-on-change is set to `auto`.
 - Add `watch = ["relative/path", "/abs/path"]` to a service target to restrict restarts to specific directories.
 - When omitted, rufa watches the entire workspace.
-- Control who handles restarts via `watch_type` (defaults to `PREFER_RUNTIME_SUPPLIED`). Use `RUFA` to force rufa-managed restarts; leave default to let runtime-specific flags (e.g., Bun `--watch`) be injected automatically.
+- Control who handles refreshes via `refresh_watch_type` (defaults to `PREFER_RUNTIME_SUPPLIED`). Use `RUFA` to force rufa-managed restarts; leave the default to let runtime-specific flags (e.g., Bun `--watch`) be injected automatically when refresh-on-change is enabled.
 
-- `rufa start [--watch|--no-watch] [--foreground] [--env FILE]` – launch the supervisor. By default it runs in the background; add `--foreground` to keep it attached to the terminal and mirror log output. Use `--watch` to make future starts default to restart-on-change, and supply `--env` to load variables before booting the supervisor.
+- `rufa start [--foreground] [--env FILE]` – launch the supervisor. By default it runs in the background; add `--foreground` to keep it attached to the terminal and mirror log output. Supply `--env` to load variables before booting the supervisor.
+- `rufa refresh set {auto|off}` – toggle automatic refresh-on-change for runtime-managed services.
+- `rufa refresh stale-targets` – restart services that saw changes while refresh-on-change was disabled.
 - `rufa target start TARGET... [--foreground]` – start one or more targets. Add `--foreground` to stream just those targets’ logs and stop them with Ctrl+C.
 - `rufa target stop TARGET...` – stop running targets without shutting down the daemon.
 - `rufa info [--foreground] [--log-length N]` – show the currently running set, their PIDs, ports, debug addresses, and recent log lines (default 5). Add `--foreground` for a live, in-place view.
@@ -122,7 +124,7 @@ Re-run the command after upgrading rufa so the completions stay current. Command
 2. Start the supervisor with `rufa start` (add `--background` to detach).
 3. Launch the desired targets via `rufa target start ...`.
 4. Use `rufa info` to share runtime details (ports, URLs, debug ports) with the agent.
-5. The agent reads `rufa log` or tails specific targets to validate behavior after each change; enable automatic restarts by starting the daemon with `rufa start --watch`.
+5. The agent reads `rufa log` or tails specific targets to validate behavior after each change; enable automatic refreshes by running `rufa refresh set auto`.
 6. Use `rufa target stop` to halt individual targets or `rufa stop` when the development session ends to clean up.
 
 ## Notes for Future Enhancements
