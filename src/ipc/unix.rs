@@ -21,11 +21,12 @@ use tokio::{
 
 use crate::config::{self, Config, Target, TargetBehavior, WatchPreference};
 use crate::ipc::{
-    AvailableTargetSummary, BehaviorKind, ConfigureRequest, ExitDetails, InfoRequest, InfoResponse,
-    KillRequest, LockInfo, LogRequest, PortSummary, RestartRequest, RunRequest, lock,
+    AvailableTargetSummary, BehaviorKind, ConfigureRequest, ControlStateSummary, ExitDetails,
+    InfoRequest, InfoResponse, KillRequest, LockInfo, LogRequest, PortSummary, RestartRequest,
+    RunRequest, lock,
     protocol::{
-        ClientCommand, RestartStatusSummary, RunHistorySummary, RunningTargetSummary,
-        ServerResponse, StoppedTargetSummary, TargetConfigSummary, TargetRunState,
+        ClientCommand, RunHistorySummary, RunningTargetSummary, ServerResponse,
+        StoppedTargetSummary, TargetConfigSummary, TargetGenerationSummary, TargetRunState,
         WatchPreferenceKind,
     },
 };
@@ -309,7 +310,7 @@ async fn handle_connection(stream: UnixStream, context: Arc<ServerContext>) -> R
                 "received run request"
             );
 
-            match context.runner.launch_targets(&request.targets, watch).await {
+            match context.runner.request_run(&request.targets, watch).await {
                 Ok(outcome) => {
                     if let Some(spec) = outcome.rufa_watch {
                         if let Err(error) = context
@@ -326,7 +327,7 @@ async fn handle_connection(stream: UnixStream, context: Arc<ServerContext>) -> R
                     ServerResponse::Ack
                 }
                 Err(error) => {
-                    tracing::error!(%error, "failed to launch targets");
+                    tracing::error!(%error, "failed to queue run request");
                     ServerResponse::Error(error.to_string())
                 }
             }
@@ -355,10 +356,18 @@ async fn handle_connection(stream: UnixStream, context: Arc<ServerContext>) -> R
             let mut exclude = running_names;
             exclude.extend(stopped_names.iter().cloned());
             let available = gather_available_targets(&config, &request.targets, &exclude);
+            let generations = context
+                .runner
+                .generation_snapshot()
+                .await
+                .into_iter()
+                .map(|(name, generation)| TargetGenerationSummary { name, generation })
+                .collect();
             let response = InfoResponse {
                 running: running_summaries,
                 stopped: stopped_summaries,
                 available,
+                generations,
             };
             write_response(&mut write_half, ServerResponse::Info(response)).await?;
             return Ok(false);
@@ -377,7 +386,7 @@ async fn handle_connection(stream: UnixStream, context: Arc<ServerContext>) -> R
             tracing::info!(targets = ?request.targets, all = request.all, "received restart request");
             match context
                 .runner
-                .restart_targets(&request.targets, request.all)
+                .request_restart(&request.targets, request.all)
                 .await
             {
                 Ok(outcome) => {
@@ -395,7 +404,7 @@ async fn handle_connection(stream: UnixStream, context: Arc<ServerContext>) -> R
                     ServerResponse::Ack
                 }
                 Err(error) => {
-                    tracing::error!(%error, "failed to restart targets");
+                    tracing::error!(%error, "failed to queue restart request");
                     ServerResponse::Error(error.to_string())
                 }
             }
@@ -425,9 +434,10 @@ async fn handle_connection(stream: UnixStream, context: Arc<ServerContext>) -> R
         }
         ClientCommand::Stop => {
             tracing::info!("received stop request");
-            match context.runner.stop_all().await {
+            let stop_targets = context.runner.stop_all().await;
+            context.watch.disable().await;
+            match stop_targets {
                 Ok(()) => {
-                    context.watch.disable().await;
                     write_response(&mut write_half, ServerResponse::Ack).await?;
                     return Ok(true);
                 }
@@ -511,7 +521,6 @@ async fn gather_running_targets(
             ports: build_port_summaries(unit, &target_state.ports),
             last_log: target_state.last_log_line.clone(),
             last_exit: target_state.last_exit.as_ref().map(exit_details_from_state),
-            restart: restart_status_summary(target_state),
         };
 
         let history = target_state
@@ -520,12 +529,21 @@ async fn gather_running_targets(
             .map(run_history_summary)
             .collect();
 
+        let control = runner
+            .control_info(name)
+            .await
+            .map(|info| ControlStateSummary {
+                desired_state: info.desired_state,
+                action_plan: info.action_plan,
+            });
+
         running.push(RunningTargetSummary {
             name: name.clone(),
             kind,
             config: config_summary,
             current,
             history,
+            control,
         });
 
         names.insert(name.clone());
@@ -601,13 +619,21 @@ async fn gather_stopped_targets(
             .map(run_history_summary)
             .collect();
 
+        let control = runner
+            .control_info(name)
+            .await
+            .map(|info| ControlStateSummary {
+                desired_state: info.desired_state,
+                action_plan: info.action_plan,
+            });
+
         stopped.push(StoppedTargetSummary {
             name: name.clone(),
             kind,
             config: config_summary,
             last,
             history,
-            restart: restart_status_summary(target_state),
+            control,
         });
 
         names.insert(name.clone());
@@ -710,23 +736,6 @@ fn run_history_summary(record: &crate::state::RunRecord) -> RunHistorySummary {
     }
 }
 
-fn restart_status_summary(state: &crate::state::TargetState) -> Option<RestartStatusSummary> {
-    if !state.restart_pending {
-        return None;
-    }
-
-    let delay_seconds = state.restart_delay.map(|d| d.as_secs_f64());
-    let scheduled_for = state
-        .restart_scheduled_for
-        .map(|time| DateTime::<Utc>::from(time).to_rfc3339());
-
-    Some(RestartStatusSummary {
-        attempt: state.restart_attempt,
-        delay_seconds,
-        scheduled_for,
-    })
-}
-
 fn exit_details_from_state(exit: &ExitStatus) -> ExitDetails {
     let timestamp = DateTime::<Utc>::from(exit.when).to_rfc3339();
     ExitDetails {
@@ -740,13 +749,12 @@ fn initialize_runner(
     config_path: &Path,
     env_override_path: Option<PathBuf>,
 ) -> Result<Arc<Runner>> {
-    let (log_config, restart_config, history_keep) = match config::load_from_path(config_path) {
-        Ok(cfg) => (cfg.log, cfg.restart, cfg.run_history.keep_runs),
+    let (log_config, history_keep) = match config::load_from_path(config_path) {
+        Ok(cfg) => (cfg.log, cfg.run_history.keep_runs),
         Err(error) => {
             tracing::warn!(%error, path = ?config_path, "using default logging configuration");
             (
                 config::LogConfig::default(),
-                config::RestartConfig::default(),
                 config::RunHistoryConfig::default().keep_runs,
             )
         }
@@ -754,14 +762,14 @@ fn initialize_runner(
 
     let logger = Arc::new(EventLogger::new(log_config).context("initializing event logger")?);
     let state = Arc::new(RwLock::new(RuntimeState::default()));
-    let runner = Arc::new(Runner::new(
+    let runner = Runner::new(
         config_path.to_path_buf(),
         logger,
         state,
-        restart_config,
         history_keep,
         env_override_path,
-    ));
+    )?;
+    let runner = Arc::new(runner);
     runner.spawn_background_tasks();
     Ok(runner)
 }

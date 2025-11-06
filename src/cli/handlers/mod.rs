@@ -1,33 +1,26 @@
+use super::log_io;
 use super::*;
-use std::{
-    borrow::Cow,
-    collections::{HashMap, HashSet},
-    fs, io,
-    io::Write,
-    path::{Path, PathBuf},
-    sync::Arc,
-    time::Duration,
-};
-
-use crate::config;
 use crate::env::OVERRIDE_ENV_FILE_VAR;
 use crate::ipc::{
     BehaviorKind, ConfigureRequest, InfoRequest, InfoResponse, KillRequest, RestartRequest,
-    RestartStatusSummary, RunHistorySummary, RunRequest, RunningTargetSummary, ServerResponse,
-    StoppedTargetSummary, TargetConfigSummary, TargetRunState, WatchPreferenceKind,
-    connect_existing_client, require_daemon_client, run_daemon, spawn_daemon_process,
-    wait_for_daemon_ready, wait_for_shutdown,
+    RunHistorySummary, RunRequest, RunningTargetSummary, ServerResponse, StoppedTargetSummary,
+    TargetConfigSummary, TargetRunState, WatchPreferenceKind, connect_existing_client,
+    require_daemon_client, run_daemon, spawn_daemon_process, wait_for_daemon_ready,
+    wait_for_shutdown,
 };
 use anyhow::Context;
-use parking_lot::Mutex;
 use std::io::IsTerminal;
+use std::{
+    collections::HashMap, fs, future::Future, io, io::Write, path::Path, pin::Pin, time::Duration,
+};
 use terminal_size::terminal_size;
 use tokio::{
-    io::{AsyncReadExt, AsyncSeekExt},
     signal,
     time::{Duration as TokioDuration, sleep},
 };
-use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
+use unicode_width::UnicodeWidthStr;
+
+use crate::paths;
 
 pub async fn init(_args: InitArgs) -> Result<()> {
     let cwd = std::env::current_dir().context("determining working directory")?;
@@ -83,28 +76,10 @@ pub async fn start(args: StartArgs) -> Result<()> {
             None => unsafe { std::env::remove_var(OVERRIDE_ENV_FILE_VAR) },
         }
 
-        let log_path = resolve_log_path();
-        let mut start_offset = 0;
-        if let Ok(meta) = fs::metadata(&log_path) {
-            start_offset = meta.len();
-        }
-        let empty_targets: Vec<String> = Vec::new();
-        let filters = LogFilters::new(&empty_targets, None, true, HashMap::<String, u64>::new())?;
-
         println!("starting rufa daemon in foreground (press Ctrl+C to stop)");
-        println!("streaming logs to stdout...");
-        let follow_task = tokio::spawn({
-            let filters = filters.clone();
-            async move {
-                if let Err(error) = follow_log_stream(log_path, filters, start_offset).await {
-                    eprintln!("log streaming terminated: {error}");
-                }
-            }
-        });
+        println!("logs directory: {}", paths::logs_dir().display());
 
         let result = run_daemon().await;
-        follow_task.abort();
-        let _ = follow_task.await;
         unsafe {
             std::env::remove_var("RUFA_DEFAULT_WATCH");
         }
@@ -162,12 +137,6 @@ pub async fn run(args: RunArgs) -> Result<()> {
     let watch_setting = watch_setting_from_flags(watch, no_watch);
 
     let client = require_daemon_client().await?;
-    let log_path = resolve_log_path();
-    let start_offset = if foreground {
-        fs::metadata(&log_path).map(|meta| meta.len()).unwrap_or(0)
-    } else {
-        0
-    };
     let request = RunRequest {
         targets,
         watch: watch_setting,
@@ -180,13 +149,35 @@ pub async fn run(args: RunArgs) -> Result<()> {
                     display_targets.join(", ")
                 );
 
-                let filters = LogFilters::new(&display_targets, None, true, HashMap::new())?;
+                let info_request = InfoRequest {
+                    targets: display_targets.clone(),
+                };
+                let generation_map = match client.info(info_request).await? {
+                    ServerResponse::Info(response) => response
+                        .generations
+                        .into_iter()
+                        .map(|item| (item.name, item.generation))
+                        .collect(),
+                    ServerResponse::Error(message) => bail!(message),
+                    ServerResponse::Ack => HashMap::new(),
+                };
 
-                let mut follow_future = Box::pin(follow_log_stream(
-                    log_path.clone(),
-                    filters.clone(),
-                    start_offset,
-                ));
+                let sources =
+                    log_io::build_sources(&display_targets, None, false, &generation_map)?;
+
+                println!("logs directory: {}", paths::logs_dir().display());
+                let mut follow_future: Pin<Box<dyn Future<Output = Result<()>> + Send>> =
+                    if sources.is_empty() {
+                        Box::pin(async {
+                            loop {
+                                sleep(TokioDuration::from_millis(500)).await;
+                            }
+                            #[allow(unreachable_code)]
+                            Ok::<(), anyhow::Error>(())
+                        })
+                    } else {
+                        Box::pin(log_io::follow_sources(sources))
+                    };
 
                 tokio::select! {
                     res = &mut follow_future => {
@@ -316,48 +307,81 @@ pub async fn info(args: InfoArgs) -> Result<()> {
 }
 
 pub async fn log(args: LogArgs) -> Result<()> {
-    let log_path = resolve_log_path();
-    println!("log file: {}", log_path.display());
+    let mut generation_map = HashMap::new();
+    let mut targets_request = args.targets.clone();
 
-    let (contents, file_len) = match fs::read_to_string(&log_path) {
-        Ok(data) => {
-            let len = fs::metadata(&log_path)
-                .map(|meta| meta.len())
-                .unwrap_or_else(|_| data.len() as u64);
-            (Some(data), len)
+    if let Some(client) = connect_existing_client().await? {
+        let info_request = InfoRequest {
+            targets: if targets_request.is_empty() {
+                Vec::new()
+            } else {
+                targets_request.clone()
+            },
+        };
+        match client.info(info_request).await? {
+            ServerResponse::Info(response) => {
+                generation_map = response
+                    .generations
+                    .into_iter()
+                    .map(|item| (item.name, item.generation))
+                    .collect();
+            }
+            ServerResponse::Error(message) => bail!(message),
+            ServerResponse::Ack => {}
         }
-        Err(error) if error.kind() == io::ErrorKind::NotFound => {
-            println!("log file does not exist yet");
-            (None, 0)
-        }
-        Err(error) => {
-            return Err(error).with_context(|| format!("reading log file {}", log_path.display()));
-        }
-    };
-
-    let latest_generations = contents
-        .as_deref()
-        .map(|body| compute_latest_generations(body.lines()))
-        .unwrap_or_default();
-
-    let filters = LogFilters::new(&args.targets, args.generation, args.all, latest_generations)?;
-
-    if let Some(body) = contents.as_ref() {
-        print_log_snapshot(body, &filters, args.tail);
+    } else {
+        generation_map = log_io::read_generations_from_disk().unwrap_or_default();
     }
 
-    let start_offset = file_len;
+    if targets_request.is_empty() {
+        targets_request = generation_map.keys().cloned().collect();
+        targets_request.sort();
+    }
+
+    if targets_request.is_empty() {
+        println!("no log sources available");
+        return Ok(());
+    }
+
+    let sources =
+        log_io::build_sources(&targets_request, args.generation, args.all, &generation_map)?;
+
+    if sources.is_empty() {
+        println!("no logs found for requested selection");
+        return Ok(());
+    }
+
+    println!("logs directory: {}", paths::logs_dir().display());
+
+    let mut entry_sets = Vec::new();
+    for source in &sources {
+        match log_io::read_entries(source) {
+            Ok(entries) => entry_sets.push(entries),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+            Err(error) => {
+                return Err(error).with_context(|| format!("reading {}", source.path().display()));
+            }
+        }
+    }
+
+    let mut merged = log_io::merge_entries(entry_sets);
+    if let Some(tail) = args.tail {
+        merged = log_io::take_last(merged, tail);
+    }
+
+    for entry in &merged {
+        let formatted = log_io::format_entry(entry);
+        println!("{}", log_io::colorize_line(&formatted));
+    }
 
     if !args.follow {
         return Ok(());
     }
 
+    println!("logs directory: {}", paths::logs_dir().display());
     println!("-- following logs (press Ctrl+C to stop) --");
-    let follow_filters = filters.clone();
-    let follow_path = log_path.clone();
-
     tokio::select! {
-        result = follow_log_stream(follow_path, follow_filters, start_offset) => result,
+        result = log_io::follow_sources(sources) => result,
         _ = signal::ctrl_c() => {
             println!();
             Ok(())
@@ -504,6 +528,10 @@ fn write_running_summary<W: Write>(
         behavior_label(target.kind)
     )?;
     write_config_details(writer, &target.config)?;
+    if let Some(control) = target.control.as_ref() {
+        writeln!(writer, "      desired state: {}", control.desired_state)?;
+        writeln!(writer, "      action plan: {}", control.action_plan)?;
+    }
     writeln!(
         writer,
         "      current run: {}",
@@ -556,8 +584,9 @@ fn write_stopped_summary<W: Write>(
         behavior_label(target.kind)
     )?;
     write_config_details(writer, &target.config)?;
-    if let Some(restart) = target.restart.as_ref() {
-        write_restart_status(writer, "      ", restart, colorize)?;
+    if let Some(control) = target.control.as_ref() {
+        writeln!(writer, "      desired state: {}", control.desired_state)?;
+        writeln!(writer, "      action plan: {}", control.action_plan)?;
     }
     match &target.last {
         Some(last) => {
@@ -627,13 +656,10 @@ fn write_run_state<W: Write>(
             writeln!(writer, "{indent}  {}", format_port_summary(port))?;
         }
     }
-    if let Some(restart) = state.restart.as_ref() {
-        write_restart_status(writer, indent, restart, colorize)?;
-    }
     write_last_logs(
         writer,
         target_name,
-        Some(state.generation),
+        state.generation,
         indent,
         log_lines,
         terminal_width,
@@ -643,30 +669,6 @@ fn write_run_state<W: Write>(
         writeln!(writer, "{indent}last exit: {}", format_exit_summary(exit))?;
     }
     Ok(())
-}
-
-fn write_restart_status<W: Write>(
-    writer: &mut W,
-    indent: &str,
-    restart: &RestartStatusSummary,
-    colorize: bool,
-) -> io::Result<()> {
-    let mut parts = Vec::new();
-    parts.push(format!("attempt {}", restart.attempt.max(1)));
-    if let Some(delay) = restart.delay_seconds {
-        parts.push(format!("next in {:.1}s", delay));
-    }
-    if let Some(at) = &restart.scheduled_for {
-        parts.push(format!("scheduled for {}", at));
-    }
-
-    let label = if colorize {
-        "\u{001b}[33mrestart pending\u{001b}[0m"
-    } else {
-        "restart pending"
-    };
-
-    writeln!(writer, "{indent}{label}: {}", parts.join(", "))
 }
 
 fn write_history_section<W: Write>(
@@ -730,7 +732,7 @@ fn write_run_snapshot<W: Write>(
     write_last_logs(
         writer,
         target_name,
-        Some(record.generation),
+        record.generation,
         &nested_indent,
         log_lines,
         terminal_width,
@@ -754,7 +756,7 @@ fn format_generation_heading(generation: u64, is_current: bool, colorize: bool) 
 fn write_last_logs<W: Write>(
     writer: &mut W,
     target: &str,
-    generation: Option<u64>,
+    generation: u64,
     indent: &str,
     limit: usize,
     terminal_width: Option<usize>,
@@ -764,7 +766,10 @@ fn write_last_logs<W: Write>(
         return Ok(());
     }
 
-    match tail_logs_for_target(target, generation, limit) {
+    let available_width = terminal_width
+        .and_then(|width| width.checked_sub(UnicodeWidthStr::width(indent).saturating_add(2)));
+
+    match log_io::tail_logs_for_target(target, generation, limit, available_width) {
         Ok(lines) => {
             if lines.is_empty() {
                 writeln!(writer, "{indent}last logs: none")?;
@@ -774,14 +779,8 @@ fn write_last_logs<W: Write>(
                 } else {
                     writeln!(writer, "{indent}last logs:")?;
                 }
-                let available_width = terminal_width.and_then(|width| {
-                    let prefix_width = UnicodeWidthStr::width(indent).saturating_add(2);
-                    width.checked_sub(prefix_width)
-                });
-                for log_line in lines {
-                    let trimmed = log_line.trim_end();
-                    let truncated = maybe_truncate_line(trimmed, available_width);
-                    let colored = colorize_log_line(truncated.as_ref());
+                for line in lines {
+                    let colored = log_io::colorize_line(&line);
                     writeln!(writer, "{indent}  {colored}")?;
                 }
             }
@@ -794,68 +793,12 @@ fn write_last_logs<W: Write>(
     Ok(())
 }
 
-fn maybe_truncate_line<'a>(line: &'a str, max_width: Option<usize>) -> Cow<'a, str> {
-    match max_width {
-        None => Cow::Borrowed(line),
-        Some(0) => Cow::Owned(String::new()),
-        Some(limit) => {
-            if UnicodeWidthStr::width(line) <= limit {
-                Cow::Borrowed(line)
-            } else {
-                let mut acc = String::with_capacity(line.len());
-                let mut width = 0;
-                for ch in line.chars() {
-                    let ch_width = UnicodeWidthChar::width(ch).unwrap_or(0);
-                    if width + ch_width > limit {
-                        break;
-                    }
-                    acc.push(ch);
-                    width += ch_width;
-                }
-                Cow::Owned(acc)
-            }
-        }
-    }
-}
-
 fn detect_terminal_width() -> Option<usize> {
     if std::io::stdout().is_terminal() {
         terminal_size().map(|(width, _)| width.0 as usize)
     } else {
         None
     }
-}
-
-fn tail_logs_for_target(
-    target: &str,
-    generation: Option<u64>,
-    limit: usize,
-) -> io::Result<Vec<String>> {
-    if limit == 0 {
-        return Ok(Vec::new());
-    }
-
-    let path = resolve_log_path();
-    let contents = fs::read_to_string(&path)?;
-    let mut matches = Vec::new();
-    for line in contents.lines() {
-        let columns: Vec<&str> = line.splitn(4, '|').collect();
-        if columns.len() < 4 {
-            continue;
-        }
-        if !columns[0].trim().eq_ignore_ascii_case(target) {
-            continue;
-        }
-        if let Some(requested_generation) = generation {
-            if columns[1].trim().parse::<u64>().ok() != Some(requested_generation) {
-                continue;
-            }
-        }
-        matches.push(line.to_string());
-    }
-
-    let start = matches.len().saturating_sub(limit);
-    Ok(matches.into_iter().skip(start).collect())
 }
 
 fn watch_preference_label(kind: WatchPreferenceKind) -> &'static str {
@@ -911,272 +854,6 @@ fn format_exit_summary(exit: &crate::ipc::ExitDetails) -> String {
     } else {
         parts.join(", ")
     }
-}
-
-fn resolve_log_path() -> PathBuf {
-    let config_path = Path::new("rufa.toml");
-    match config::load_from_path(config_path) {
-        Ok(cfg) => cfg.log.file,
-        Err(_) => PathBuf::from("rufa.log"),
-    }
-}
-
-fn print_log_snapshot(contents: &str, filters: &LogFilters, tail: Option<usize>) {
-    let mut lines = filtered_lines(contents.lines(), filters);
-    if let Some(count) = tail {
-        if lines.len() > count {
-            let drain_count = lines.len() - count;
-            lines.drain(0..drain_count);
-        }
-    }
-
-    for line in lines {
-        println!("{}", colorize_log_line(&line));
-    }
-}
-
-async fn follow_log_stream(log_path: PathBuf, filters: LogFilters, mut offset: u64) -> Result<()> {
-    use tokio::{fs::File, io::SeekFrom};
-
-    loop {
-        match tokio::fs::metadata(&log_path).await {
-            Ok(meta) => {
-                if meta.len() < offset {
-                    offset = 0;
-                }
-            }
-            Err(error) if error.kind() == io::ErrorKind::NotFound => {
-                offset = 0;
-                sleep(TokioDuration::from_millis(500)).await;
-                continue;
-            }
-            Err(error) => {
-                return Err(error).with_context(|| format!("accessing {}", log_path.display()));
-            }
-        }
-
-        let mut file = match File::open(&log_path).await {
-            Ok(file) => file,
-            Err(error) if error.kind() == io::ErrorKind::NotFound => {
-                offset = 0;
-                sleep(TokioDuration::from_millis(500)).await;
-                continue;
-            }
-            Err(error) => {
-                return Err(error).with_context(|| format!("opening {}", log_path.display()));
-            }
-        };
-
-        file.seek(SeekFrom::Start(offset)).await?;
-
-        let mut buffer = String::new();
-        let bytes_read = file.read_to_string(&mut buffer).await?;
-        if bytes_read > 0 {
-            for line in buffer.lines() {
-                if let Some(parsed) = parse_log_line(line) {
-                    filters.update_latest(&parsed);
-                    if filters.matches(&parsed) {
-                        println!("{}", colorize_log_line(line));
-                    }
-                } else if filters.allow_unparsed() {
-                    println!("{}", colorize_log_line(line));
-                }
-            }
-            offset += bytes_read as u64;
-        }
-
-        sleep(TokioDuration::from_millis(500)).await;
-    }
-}
-
-#[derive(Clone)]
-struct LogFilters {
-    targets: HashSet<String>,
-    generation: Option<u64>,
-    allow_all_generations: bool,
-    latest: Arc<Mutex<HashMap<String, u64>>>,
-}
-
-impl LogFilters {
-    fn new(
-        targets: &[String],
-        generation: Option<u64>,
-        all_generations: bool,
-        latest: HashMap<String, u64>,
-    ) -> Result<Self> {
-        if generation.is_some() && all_generations {
-            bail!("cannot combine --generation with --all");
-        }
-
-        let normalized = targets
-            .iter()
-            .map(|value| value.to_ascii_uppercase())
-            .collect::<HashSet<_>>();
-        Ok(Self {
-            targets: normalized,
-            generation,
-            allow_all_generations: all_generations,
-            latest: Arc::new(Mutex::new(latest)),
-        })
-    }
-
-    fn matches(&self, parsed: &ParsedLogLine) -> bool {
-        if let Some(filter) = self.generation {
-            if parsed.generation != Some(filter) {
-                return false;
-            }
-        } else if !self.allow_all_generations {
-            if let Some(generation) = parsed.generation {
-                let latest = self.latest.lock();
-                match latest.get(parsed.target_upper.as_str()) {
-                    Some(current) if generation == *current => {}
-                    Some(_) => return false,
-                    None => return false,
-                }
-            } else {
-                return false;
-            }
-        }
-
-        if self.targets.is_empty() {
-            return true;
-        }
-
-        self.targets.contains(parsed.target_upper.as_str())
-    }
-
-    fn update_latest(&self, parsed: &ParsedLogLine) {
-        if self.allow_all_generations || self.generation.is_some() {
-            return;
-        }
-
-        if let Some(generation) = parsed.generation {
-            let mut latest = self.latest.lock();
-            let entry = latest
-                .entry(parsed.target_upper.clone())
-                .or_insert(generation);
-            if generation > *entry {
-                *entry = generation;
-            }
-        }
-    }
-
-    fn allow_unparsed(&self) -> bool {
-        self.targets.is_empty() && (self.allow_all_generations || self.generation.is_none())
-    }
-}
-
-struct ParsedLogLine {
-    generation: Option<u64>,
-    target_upper: String,
-}
-
-fn parse_log_line(line: &str) -> Option<ParsedLogLine> {
-    let mut parts = line.split('|');
-    let target = parts.next()?.trim();
-    let generation = parts
-        .next()
-        .and_then(|value| value.trim().parse::<u64>().ok());
-    Some(ParsedLogLine {
-        generation,
-        target_upper: target.to_ascii_uppercase(),
-    })
-}
-
-fn filtered_lines<'a>(lines: impl Iterator<Item = &'a str>, filters: &LogFilters) -> Vec<String> {
-    let mut results = Vec::new();
-    for line in lines {
-        if let Some(parsed) = parse_log_line(line) {
-            if filters.matches(&parsed) {
-                results.push(line.to_string());
-            }
-        } else if filters.allow_unparsed() {
-            results.push(line.to_string());
-        }
-    }
-    results
-}
-
-fn compute_latest_generations<'a>(lines: impl Iterator<Item = &'a str>) -> HashMap<String, u64> {
-    let mut map = HashMap::new();
-    for line in lines {
-        if let Some(parsed) = parse_log_line(line) {
-            if let Some(generation) = parsed.generation {
-                let key = parsed.target_upper;
-                let entry = map.entry(key).or_insert(generation);
-                if generation > *entry {
-                    *entry = generation;
-                }
-            }
-        }
-    }
-    map
-}
-
-fn colorize_log_line(line: &str) -> String {
-    let parts: Vec<&str> = line.splitn(4, '|').collect();
-    let mut colored = String::with_capacity(line.len() + 32);
-    if parts.len() == 4 {
-        for (idx, part) in parts.iter().enumerate() {
-            if idx < 3 {
-                colored.push_str("\u{001b}[38;5;244m");
-                colored.push_str(part);
-                colored.push_str("\u{001b}[0m");
-                colored.push('|');
-            } else {
-                let level_colored = apply_level_color(part);
-                if level_colored == *part {
-                    colored.push_str("\u{001b}[38;5;244m");
-                    colored.push_str(part);
-                    colored.push_str("\u{001b}[0m");
-                } else {
-                    colored.push_str(&level_colored);
-                }
-            }
-        }
-    } else {
-        let level_colored = apply_level_color(line);
-        if level_colored == line {
-            colored.push_str("\u{001b}[38;5;244m");
-            colored.push_str(line);
-            colored.push_str("\u{001b}[0m");
-        } else {
-            colored.push_str(&level_colored);
-        }
-    }
-    colored
-}
-
-fn apply_level_color(segment: &str) -> String {
-    lazy_static::lazy_static! {
-        static ref LOG_LEVEL_PATTERN: regex::Regex =
-            regex::Regex::new(r"(?P<prefix>[ \t\(\[])(?P<level>ERROR|WARN|INFO)(?P<suffix>[ \t\)\]])")
-                .expect("valid log level regex");
-    }
-
-    let mut result = String::with_capacity(segment.len() + 16);
-    let mut last = 0usize;
-    for mat in LOG_LEVEL_PATTERN.captures_iter(segment) {
-        let m = mat.get(0).expect("match present");
-        result.push_str(&segment[last..m.start()]);
-        let prefix = mat.name("prefix").unwrap().as_str();
-        let level = mat.name("level").unwrap().as_str();
-        let suffix = mat.name("suffix").unwrap().as_str();
-
-        result.push_str(prefix);
-        let colored_level = match level {
-            "ERROR" => "\u{001b}[31mERROR\u{001b}[0m",
-            "WARN" => "\u{001b}[33mWARN\u{001b}[0m",
-            "INFO" => "\u{001b}[32mINFO\u{001b}[0m",
-            _ => level,
-        };
-        result.push_str(colored_level);
-        result.push_str(suffix);
-
-        last = m.end();
-    }
-    result.push_str(&segment[last..]);
-    result
 }
 
 fn handle_rufa_toml(root: &Path) -> Result<()> {

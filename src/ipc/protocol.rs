@@ -65,6 +65,7 @@ pub struct InfoResponse {
     pub running: Vec<RunningTargetSummary>,
     pub stopped: Vec<StoppedTargetSummary>,
     pub available: Vec<AvailableTargetSummary>,
+    pub generations: Vec<TargetGenerationSummary>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -74,6 +75,7 @@ pub struct RunningTargetSummary {
     pub config: TargetConfigSummary,
     pub current: TargetRunState,
     pub history: Vec<RunHistorySummary>,
+    pub control: Option<ControlStateSummary>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -83,7 +85,7 @@ pub struct StoppedTargetSummary {
     pub config: TargetConfigSummary,
     pub last: Option<RunHistorySummary>,
     pub history: Vec<RunHistorySummary>,
-    pub restart: Option<RestartStatusSummary>,
+    pub control: Option<ControlStateSummary>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -112,7 +114,6 @@ pub struct TargetRunState {
     pub ports: Vec<PortSummary>,
     pub last_log: Option<String>,
     pub last_exit: Option<ExitDetails>,
-    pub restart: Option<RestartStatusSummary>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -132,10 +133,15 @@ pub struct RunHistorySummary {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct RestartStatusSummary {
-    pub attempt: u32,
-    pub delay_seconds: Option<f64>,
-    pub scheduled_for: Option<String>,
+pub struct ControlStateSummary {
+    pub desired_state: String,
+    pub action_plan: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TargetGenerationSummary {
+    pub name: String,
+    pub generation: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

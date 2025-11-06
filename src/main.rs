@@ -4,6 +4,7 @@ mod debug_update;
 mod env;
 mod ipc;
 mod logging;
+mod paths;
 mod runner;
 mod state;
 mod watch;

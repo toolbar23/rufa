@@ -1,12 +1,12 @@
 mod lock;
 mod protocol;
 
-pub use lock::LockInfo;
+pub use lock::{LockInfo, runtime_dir};
 pub use protocol::{
-    AvailableTargetSummary, BehaviorKind, ConfigureRequest, ExitDetails, InfoRequest, InfoResponse,
-    KillRequest, LogRequest, PortSummary, RestartRequest, RestartStatusSummary, RunHistorySummary,
-    RunRequest, RunningTargetSummary, ServerResponse, StoppedTargetSummary, TargetConfigSummary,
-    TargetRunState, WatchPreferenceKind,
+    AvailableTargetSummary, BehaviorKind, ConfigureRequest, ControlStateSummary, ExitDetails,
+    InfoRequest, InfoResponse, KillRequest, LogRequest, PortSummary, RestartRequest,
+    RunHistorySummary, RunRequest, RunningTargetSummary, ServerResponse, StoppedTargetSummary,
+    TargetConfigSummary, TargetRunState, WatchPreferenceKind,
 };
 
 #[cfg(unix)]

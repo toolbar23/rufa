@@ -2,9 +2,10 @@
 
 //! Runtime process launcher and supervisor.
 
+mod control;
 mod drivers;
+mod generation;
 mod ports;
-mod restart;
 
 use std::{
     collections::{HashMap, HashSet},
@@ -26,14 +27,14 @@ use regex::Regex;
 use tokio::{
     io::{AsyncBufReadExt, BufReader},
     process::Command,
-    sync::{Mutex, Notify, RwLock, mpsc},
+    sync::{Mutex, Notify, RwLock},
     time::{sleep, timeout},
 };
 
 use crate::{
     config::{
-        self, Config, EnvValue, ReferenceResource, RestartConfig, Target, TargetBehavior,
-        TargetName, UnitTarget, WatchPreference,
+        self, Config, EnvValue, ReferenceResource, Target, TargetBehavior, TargetName, UnitTarget,
+        WatchPreference,
     },
     debug_update::DebugUpdateContext,
     env,
@@ -41,9 +42,10 @@ use crate::{
     state::{ExitStatus, RuntimeState, TargetState},
 };
 
+use control::{Action, DesiredState, TargetControl, TargetKind, TargetStatus};
 use drivers::resolve_command;
+use generation::TargetGenerationStore;
 use ports::{PortAllocator, PortSentrySet, restore_port_sentries};
-use restart::{RestartCoordinator, RestartJob, RestartSchedule, update_runtime_restart_state};
 
 #[derive(Debug)]
 pub struct Runner {
@@ -53,8 +55,9 @@ pub struct Runner {
     port_allocator: Arc<Mutex<PortAllocator>>,
     processes: Arc<RwLock<HashMap<String, Arc<ProcessHandle>>>>,
     port_sentries: Arc<RwLock<HashMap<String, PortSentrySet>>>,
-    restart: Arc<RestartCoordinator>,
-    restart_rx: Mutex<mpsc::Receiver<RestartJob>>,
+    controls: Arc<RwLock<HashMap<String, TargetControl>>>,
+    in_flight: Arc<Mutex<HashSet<String>>>,
+    generations: Arc<Mutex<TargetGenerationStore>>,
     history_keep: usize,
     env_override_path: Option<PathBuf>,
 }
@@ -70,47 +73,265 @@ pub struct LaunchOutcome {
     pub rufa_watch: Option<WatchSpec>,
 }
 
+#[derive(Debug, Clone)]
+pub struct ControlInfo {
+    pub desired_state: String,
+    pub action_plan: String,
+}
+
+async fn mutate_control<F>(
+    controls: &Arc<RwLock<HashMap<String, TargetControl>>>,
+    target: &str,
+    update: F,
+) where
+    F: FnOnce(&mut TargetControl),
+{
+    let mut guard = controls.write().await;
+    let entry = guard
+        .entry(target.to_string())
+        .or_insert_with(TargetControl::new);
+    update(entry);
+}
+
 impl Runner {
     pub fn new(
         config_path: impl Into<PathBuf>,
         logger: Arc<EventLogger>,
         state: Arc<RwLock<RuntimeState>>,
-        restart_config: RestartConfig,
         history_keep: usize,
         env_override_path: Option<PathBuf>,
-    ) -> Self {
-        let (restart_tx, restart_rx) = mpsc::channel(32);
-        let restart_state = Arc::new(Mutex::new(HashMap::new()));
-        let restart_suppressed = Arc::new(Mutex::new(HashSet::new()));
-        let restart = Arc::new(RestartCoordinator::new(
-            restart_config.strategy,
-            restart_state,
-            restart_suppressed,
-            restart_tx.clone(),
-        ));
-        Self {
+    ) -> Result<Self> {
+        let generations =
+            TargetGenerationStore::new().with_context(|| "initializing target generation store")?;
+        Ok(Self {
             config_path: config_path.into(),
             logger,
             state,
             port_allocator: Arc::new(Mutex::new(PortAllocator::default())),
             processes: Arc::new(RwLock::new(HashMap::new())),
             port_sentries: Arc::new(RwLock::new(HashMap::new())),
-            restart,
-            restart_rx: Mutex::new(restart_rx),
+            controls: Arc::new(RwLock::new(HashMap::new())),
+            in_flight: Arc::new(Mutex::new(HashSet::new())),
+            generations: Arc::new(Mutex::new(generations)),
             history_keep: history_keep.max(1),
             env_override_path,
-        }
+        })
     }
 
     pub fn spawn_background_tasks(self: &Arc<Self>) {
         let runner = Arc::clone(self);
         tokio::spawn(async move {
-            runner.restart_worker_loop().await;
+            runner.control_loop().await;
         });
     }
 
     pub fn config_path(&self) -> &Path {
         &self.config_path
+    }
+
+    async fn next_generation(&self, target: &str) -> Result<u64> {
+        let mut store = self.generations.lock().await;
+        store
+            .next(target)
+            .with_context(|| format!("updating generation for target {target}"))
+    }
+
+    pub async fn generation_snapshot(&self) -> Vec<(String, u64)> {
+        let store = self.generations.lock().await;
+        store.all()
+    }
+
+    async fn ensure_control_entry(&self, target: &str) {
+        let mut guard = self.controls.write().await;
+        guard
+            .entry(target.to_string())
+            .or_insert_with(TargetControl::new);
+    }
+
+    async fn set_desired_state_for(&self, target: &str, desired: DesiredState) {
+        let mut guard = self.controls.write().await;
+        let entry = guard
+            .entry(target.to_string())
+            .or_insert_with(TargetControl::new);
+        entry.request_desired_state(desired);
+    }
+
+    async fn update_desired_state_only(&self, target: &str, desired: DesiredState) {
+        let mut guard = self.controls.write().await;
+        let entry = guard
+            .entry(target.to_string())
+            .or_insert_with(TargetControl::new);
+        entry.desired_state = desired;
+    }
+
+    async fn mark_target_running(&self, target: &str) {
+        let mut guard = self.controls.write().await;
+        let entry = guard
+            .entry(target.to_string())
+            .or_insert_with(TargetControl::new);
+        entry.settle_desired_state(DesiredState::Running);
+    }
+
+    async fn mark_target_stopped(&self, target: &str) {
+        let mut guard = self.controls.write().await;
+        let entry = guard
+            .entry(target.to_string())
+            .or_insert_with(TargetControl::new);
+        entry.settle_desired_state(DesiredState::Stopped);
+    }
+
+    async fn replace_action_plan(&self, target: &str, plan: Action) {
+        let mut guard = self.controls.write().await;
+        let entry = guard
+            .entry(target.to_string())
+            .or_insert_with(TargetControl::new);
+        entry.action_plan = plan;
+    }
+
+    async fn set_watch_request(&self, target: &str, watch: bool) {
+        let mut guard = self.controls.write().await;
+        let entry = guard
+            .entry(target.to_string())
+            .or_insert_with(TargetControl::new);
+        entry.set_watch_request(watch);
+    }
+
+    async fn set_target_kind(&self, target: &str, kind: TargetKind) {
+        let mut guard = self.controls.write().await;
+        let entry = guard
+            .entry(target.to_string())
+            .or_insert_with(TargetControl::new);
+        entry.set_kind(kind);
+    }
+
+    async fn schedule_plan_rebuild(&self, target: &str) {
+        let mut guard = self.controls.write().await;
+        let entry = guard
+            .entry(target.to_string())
+            .or_insert_with(TargetControl::new);
+        entry.schedule_plan_rebuild();
+    }
+
+    async fn control_snapshot(&self) -> HashMap<String, TargetControl> {
+        let guard = self.controls.read().await;
+        guard.clone()
+    }
+
+    pub async fn control_info(&self, target: &str) -> Option<ControlInfo> {
+        let guard = self.controls.read().await;
+        guard.get(target).map(|entry| ControlInfo {
+            desired_state: entry.desired_state.to_string(),
+            action_plan: entry.action_plan.describe(),
+        })
+    }
+
+    async fn target_status(&self, target: &str) -> TargetStatus {
+        let processes = self.processes.read().await;
+        TargetStatus {
+            is_running: processes.contains_key(target),
+        }
+    }
+
+    async fn control_loop(self: Arc<Self>) {
+        loop {
+            let targets: Vec<String> = {
+                let guard = self.controls.read().await;
+                if guard.is_empty() {
+                    drop(guard);
+                    sleep(Duration::from_millis(250)).await;
+                    continue;
+                }
+                guard.keys().cloned().collect()
+            };
+
+            for target in targets {
+                let status = self.target_status(&target).await;
+                let action_to_run = {
+                    let mut guard = self.controls.write().await;
+                    let entry = guard
+                        .entry(target.clone())
+                        .or_insert_with(TargetControl::new);
+                    if !entry.desired_state.is_fulfilled(&status) && entry.action_plan.is_idle() {
+                        entry.action_plan = entry.desired_state.make_plan(&target);
+                    }
+
+                    match &entry.action_plan {
+                        Action::Idle(_) => None,
+                        action => Some(action.clone()),
+                    }
+                };
+
+                if let Some(action) = action_to_run {
+                    let mut in_flight = self.in_flight.lock().await;
+                    if !in_flight.insert(target.clone()) {
+                        drop(in_flight);
+                        continue;
+                    }
+                    drop(in_flight);
+
+                    self.execute_action(target.clone(), action).await;
+
+                    let mut in_flight = self.in_flight.lock().await;
+                    in_flight.remove(&target);
+                }
+            }
+
+            sleep(Duration::from_millis(150)).await;
+        }
+    }
+
+    async fn execute_action(&self, target: String, action: Action) {
+        match action {
+            Action::Start {
+                on_success,
+                on_failure,
+            } => {
+                let watch_requested = {
+                    let guard = self.controls.read().await;
+                    guard
+                        .get(&target)
+                        .map(|ctrl| ctrl.watch_request)
+                        .unwrap_or(false)
+                };
+                match self
+                    .launch_targets(&[target.clone()], watch_requested)
+                    .await
+                {
+                    Ok(_) => {
+                        self.replace_action_plan(&target, *on_success).await;
+                    }
+                    Err(error) => {
+                        tracing::error!(%error, target = %target, "start action failed");
+                        self.replace_action_plan(&target, *on_failure).await;
+                    }
+                }
+            }
+            Action::Stop {
+                on_success,
+                on_failure,
+            } => match self.terminate_target(&target).await {
+                Ok(_) => {
+                    self.replace_action_plan(&target, *on_success).await;
+                }
+                Err(error) => {
+                    tracing::error!(%error, target = %target, "stop action failed");
+                    self.replace_action_plan(&target, *on_failure).await;
+                }
+            },
+            Action::SetDesiredState { desired, next } => {
+                self.update_desired_state_only(&target, desired).await;
+                self.replace_action_plan(&target, *next).await;
+            }
+            Action::Idle(result) => {
+                tracing::trace!(
+                    target = %target,
+                    result = %result,
+                    "skipping idle action"
+                );
+                self.replace_action_plan(&target, Action::Idle(result))
+                    .await;
+            }
+        }
     }
 
     pub fn logger(&self) -> Arc<EventLogger> {
@@ -119,96 +340,6 @@ impl Runner {
 
     pub fn state(&self) -> Arc<RwLock<RuntimeState>> {
         self.state.clone()
-    }
-
-    async fn restart_worker_loop(self: Arc<Self>) {
-        let mut rx = self.restart_rx.lock().await;
-        while let Some(job) = rx.recv().await {
-            self.process_restart_job(job).await;
-        }
-    }
-
-    async fn process_restart_job(&self, job: RestartJob) {
-        if job.delay > Duration::ZERO {
-            sleep(job.delay).await;
-        }
-
-        if self.consume_suppression(&job.target).await {
-            self.clear_pending_flag(&job.target).await;
-            self.reset_backoff_state(&job.target).await;
-            update_runtime_restart_state(&self.state, &job.target, false, 0, None, None).await;
-            return;
-        }
-
-        match self.launch_targets(&[job.target.clone()], false).await {
-            Ok(_) => {
-                self.clear_pending_flag(&job.target).await;
-            }
-            Err(error) => {
-                tracing::error!(%error, target = %job.target, attempt = job.attempt, "backoff restart failed to launch");
-                self.clear_pending_flag(&job.target).await;
-                let _ = self
-                    .schedule_restart_with_attempt(&job.target, Some(job.attempt.saturating_add(1)))
-                    .await;
-            }
-        }
-    }
-
-    async fn schedule_restart(&self, target: &str) {
-        let _ = self.schedule_restart_with_attempt(target, None).await;
-    }
-
-    async fn schedule_restart_with_attempt(
-        &self,
-        target: &str,
-        attempt_override: Option<u32>,
-    ) -> Result<RestartSchedule, ()> {
-        let outcome = self.restart.schedule(target, attempt_override).await?;
-
-        match outcome {
-            RestartSchedule::Scheduled { attempt, delay } => {
-                let scheduled_for = SystemTime::now().checked_add(delay);
-                update_runtime_restart_state(
-                    &self.state,
-                    target,
-                    true,
-                    attempt,
-                    Some(delay),
-                    scheduled_for,
-                )
-                .await;
-            }
-            RestartSchedule::Skipped => {
-                update_runtime_restart_state(&self.state, target, false, 0, None, None).await;
-            }
-            RestartSchedule::AlreadyPending => {}
-        }
-
-        Ok(outcome)
-    }
-
-    async fn clear_pending_flag(&self, target: &str) {
-        self.restart.clear_pending(target).await;
-    }
-
-    async fn reset_backoff_state(&self, target: &str) {
-        self.restart.reset_backoff(target).await;
-    }
-
-    async fn consume_suppression(&self, target: &str) -> bool {
-        self.restart.consume_suppression(target).await
-    }
-
-    async fn mark_restart_suppressed(&self, target: &str) {
-        self.restart.mark_suppressed(target).await;
-    }
-
-    async fn on_target_launched(&self, target: &str, behavior: &TargetBehavior) {
-        let _ = self.restart.consume_suppression(target).await;
-        if matches!(behavior, TargetBehavior::Service) {
-            self.restart.reset_backoff(target).await;
-            update_runtime_restart_state(&self.state, target, false, 0, None, None).await;
-        }
     }
 
     pub async fn watch_spec(&self, targets: &[String]) -> Result<WatchSpec> {
@@ -220,6 +351,192 @@ impl Runner {
         })?;
 
         self.watch_spec_from_config(&config, targets)
+    }
+
+    pub async fn request_run(&self, targets: &[String], watch: bool) -> Result<LaunchOutcome> {
+        let config = config::load_from_path(&self.config_path).with_context(|| {
+            format!(
+                "loading configuration from {:?}",
+                self.config_path.as_os_str()
+            )
+        })?;
+
+        let units = resolve_units(&config, targets)?;
+        if units.is_empty() {
+            bail!("no runnable targets resolved from selection");
+        }
+
+        let state_snapshot = {
+            let guard = self.state.read().await;
+            guard.clone()
+        };
+
+        let mut rufa_watch_targets = Vec::new();
+        for unit in &units {
+            let name = unit.name.clone();
+            self.set_watch_request(&name, watch).await;
+            self.set_desired_state_for(&name, DesiredState::Running)
+                .await;
+            let kind = match &unit.behavior {
+                TargetBehavior::Service => TargetKind::Service,
+                TargetBehavior::Job { .. } => TargetKind::Job,
+            };
+            self.set_target_kind(&name, kind).await;
+
+            if matches!(&unit.behavior, TargetBehavior::Service) {
+                let previous = state_snapshot.targets.get(&name);
+                let wants_rufa_watch = if watch {
+                    matches!(unit.watch_preference, WatchPreference::Rufa)
+                } else {
+                    previous.map(|state| state.rufa_watch).unwrap_or(false)
+                };
+                if wants_rufa_watch {
+                    rufa_watch_targets.push(name);
+                }
+            }
+        }
+
+        let rufa_watch = if rufa_watch_targets.is_empty() {
+            None
+        } else {
+            Some(self.watch_spec_from_config(&config, &rufa_watch_targets)?)
+        };
+
+        Ok(LaunchOutcome { rufa_watch })
+    }
+
+    pub async fn request_stop_all(&self) -> Result<()> {
+        let targets = {
+            let processes = self.processes.read().await;
+            processes.keys().cloned().collect::<Vec<_>>()
+        };
+
+        for target in targets {
+            self.set_watch_request(&target, false).await;
+            self.set_desired_state_for(&target, DesiredState::Stopped)
+                .await;
+        }
+
+        Ok(())
+    }
+
+    pub async fn request_restart(&self, targets: &[String], all: bool) -> Result<LaunchOutcome> {
+        let config = config::load_from_path(&self.config_path).with_context(|| {
+            format!(
+                "loading configuration from {:?}",
+                self.config_path.as_os_str()
+            )
+        })?;
+
+        let unit_names = if all {
+            let processes = self.processes.read().await;
+            if processes.is_empty() {
+                bail!("no services are currently running");
+            }
+            processes.keys().cloned().collect::<Vec<_>>()
+        } else {
+            if targets.is_empty() {
+                bail!("specify at least one target or use --all");
+            }
+            targets.to_vec()
+        };
+
+        let units = resolve_units(&config, &unit_names)?;
+        if units.is_empty() {
+            bail!("no runnable targets resolved from restart selection");
+        }
+
+        for unit in &units {
+            if matches!(unit.behavior, TargetBehavior::Job { .. }) {
+                bail!(
+                    "target {} is a job; re-run it explicitly instead of restarting",
+                    unit.name
+                );
+            }
+        }
+
+        let state_snapshot = self.state.read().await.clone();
+        let watch_requested = state_snapshot
+            .targets
+            .iter()
+            .filter(|(name, _)| unit_names.contains(name))
+            .any(|(_, state)| state.rufa_watch || state.runtime_watch);
+
+        let mut rufa_watch_targets = Vec::new();
+        for unit in &units {
+            let name = unit.name.clone();
+            self.set_watch_request(&name, watch_requested).await;
+            self.set_desired_state_for(&name, DesiredState::Restarted)
+                .await;
+            let kind = match &unit.behavior {
+                TargetBehavior::Service => TargetKind::Service,
+                TargetBehavior::Job { .. } => TargetKind::Job,
+            };
+            self.set_target_kind(&name, kind).await;
+
+            if matches!(&unit.behavior, TargetBehavior::Service) {
+                let previous = state_snapshot.targets.get(&name);
+                let wants_rufa_watch = if watch_requested {
+                    matches!(unit.watch_preference, WatchPreference::Rufa)
+                } else {
+                    previous.map(|state| state.rufa_watch).unwrap_or(false)
+                };
+                if wants_rufa_watch {
+                    rufa_watch_targets.push(name);
+                }
+            }
+        }
+
+        let rufa_watch = if rufa_watch_targets.is_empty() {
+            None
+        } else {
+            Some(self.watch_spec_from_config(&config, &rufa_watch_targets)?)
+        };
+
+        Ok(LaunchOutcome { rufa_watch })
+    }
+
+    pub async fn request_restart_from_watch(&self, target: &str) -> bool {
+        let should_consider = {
+            let guard = self.controls.read().await;
+            guard
+                .get(target)
+                .map(|control| {
+                    control.kind == TargetKind::Service
+                        && matches!(control.desired_state, DesiredState::Running)
+                })
+                .unwrap_or(false)
+        };
+        if !should_consider {
+            return false;
+        }
+
+        let watch_assignment = {
+            let state_guard = self.state.read().await;
+            state_guard
+                .targets
+                .get(target)
+                .map(|entry| (entry.runtime_watch, entry.rufa_watch))
+        };
+
+        let Some((runtime_watch, rufa_watch)) = watch_assignment else {
+            return false;
+        };
+
+        if runtime_watch || !rufa_watch {
+            return false;
+        }
+
+        let mut guard = self.controls.write().await;
+        if let Some(control) = guard.get_mut(target) {
+            if control.kind == TargetKind::Service
+                && matches!(control.desired_state, DesiredState::Running)
+            {
+                control.request_desired_state(DesiredState::Restarted);
+                return true;
+            }
+        }
+        false
     }
 
     fn watch_spec_from_config(&self, config: &Config, targets: &[String]) -> Result<WatchSpec> {
@@ -345,11 +662,7 @@ impl Runner {
         for unit in units {
             let ports = assignments.get(&unit.name).cloned().unwrap_or_default();
 
-            let generation = state_snapshot
-                .targets
-                .get(&unit.name)
-                .map(|state| state.generation + 1)
-                .unwrap_or(1);
+            let generation = self.next_generation(&unit.name).await?;
 
             let previous = state_snapshot.targets.get(&unit.name);
             let runtime_watch_allowed = matches!(unit.behavior, TargetBehavior::Service);
@@ -535,12 +848,10 @@ impl Runner {
             entry.record_snapshot(self.history_keep);
             entry.reset_for_new_run(generation, ports.clone(), runtime_watch, rufa_watch);
             entry.pid = pid;
-            entry.restart_attempt = 0;
-            entry.restart_pending = false;
         }
 
         let behavior = unit.behavior.clone();
-        self.on_target_launched(&target_name, &behavior).await;
+        self.mark_target_running(&target_name).await;
 
         let process_handle = Arc::new(ProcessHandle::new());
         {
@@ -572,7 +883,7 @@ impl Runner {
         let state = self.state.clone();
         let allocator = self.port_allocator.clone();
         let processes = self.processes.clone();
-        let restart = self.restart.clone();
+        let controls = self.controls.clone();
         let timeout = match &behavior {
             TargetBehavior::Job { timeout } => *timeout,
             TargetBehavior::Service => None,
@@ -598,7 +909,7 @@ impl Runner {
                 child.wait().await
             };
 
-            let mut should_restart = false;
+            let mut unexpected_service_exit = false;
             match wait_result {
                 Ok(exit_status) => {
                     let message = forced_message.unwrap_or_else(|| exit_message(&exit_status));
@@ -619,12 +930,10 @@ impl Runner {
                     if let Some(entry) = state_guard.targets.get_mut(&target_name) {
                         entry.pid = None;
                         entry.last_exit = Some(exit_snapshot);
-                        entry.restart_attempt = 0;
-                        entry.restart_pending = false;
                     }
 
                     if matches!(behavior, TargetBehavior::Service) && !exit_status.success() {
-                        should_restart = true;
+                        unexpected_service_exit = true;
                     }
                 }
                 Err(error) => {
@@ -632,57 +941,24 @@ impl Runner {
                     let mut state_guard = state.write().await;
                     if let Some(entry) = state_guard.targets.get_mut(&target_name) {
                         entry.pid = None;
-                        entry.restart_pending = false;
                     }
                     if matches!(behavior, TargetBehavior::Service) {
-                        should_restart = true;
+                        unexpected_service_exit = true;
                     }
                 }
             }
 
-            if matches!(behavior, TargetBehavior::Service) {
-                if should_restart {
-                    match restart.schedule(&target_name, None).await {
-                        Ok(RestartSchedule::Scheduled { attempt, delay }) => {
-                            let scheduled_for = SystemTime::now().checked_add(delay);
-                            update_runtime_restart_state(
-                                &state,
-                                &target_name,
-                                true,
-                                attempt,
-                                Some(delay),
-                                scheduled_for,
-                            )
-                            .await;
-                        }
-                        Ok(RestartSchedule::AlreadyPending) => {}
-                        Ok(RestartSchedule::Skipped) => {
-                            update_runtime_restart_state(
-                                &state,
-                                &target_name,
-                                false,
-                                0,
-                                None,
-                                None,
-                            )
-                            .await;
-                        }
-                        Err(_) => {
-                            update_runtime_restart_state(
-                                &state,
-                                &target_name,
-                                false,
-                                0,
-                                None,
-                                None,
-                            )
-                            .await;
-                        }
+            if unexpected_service_exit {
+                tracing::warn!(
+                    target = %target_name,
+                    "service exited unexpectedly; desired state remains {:?}",
+                    {
+                        let guard = controls.read().await;
+                        guard
+                            .get(&target_name)
+                            .map(|entry| entry.desired_state)
                     }
-                } else {
-                    restart.reset_backoff(&target_name).await;
-                    update_runtime_restart_state(&state, &target_name, false, 0, None, None).await;
-                }
+                );
             }
 
             if let Err(error) = ports::restore_port_sentries(
@@ -739,56 +1015,6 @@ impl Runner {
         });
     }
 
-    pub async fn restart_targets(&self, targets: &[String], all: bool) -> Result<LaunchOutcome> {
-        let config = config::load_from_path(&self.config_path).with_context(|| {
-            format!(
-                "loading configuration from {:?}",
-                self.config_path.as_os_str()
-            )
-        })?;
-
-        let unit_names = if all {
-            let processes = self.processes.read().await;
-            if processes.is_empty() {
-                bail!("no services are currently running");
-            }
-            processes.keys().cloned().collect::<Vec<_>>()
-        } else {
-            if targets.is_empty() {
-                bail!("specify at least one target or use --all");
-            }
-            targets.to_vec()
-        };
-
-        let units = resolve_units(&config, &unit_names)?;
-        if units.is_empty() {
-            bail!("no runnable targets resolved from restart selection");
-        }
-
-        for unit in &units {
-            if matches!(unit.behavior, TargetBehavior::Job { .. }) {
-                bail!(
-                    "target {} is a job; re-run it explicitly instead of restarting",
-                    unit.name
-                );
-            }
-        }
-
-        let state_snapshot = self.state.read().await.clone();
-        let watch_requested = state_snapshot
-            .targets
-            .iter()
-            .filter(|(name, _)| unit_names.contains(name))
-            .any(|(_, state)| state.rufa_watch || state.runtime_watch);
-        drop(state_snapshot);
-
-        for unit in &unit_names {
-            self.terminate_target(unit).await?;
-        }
-
-        self.launch_units(&config, units, watch_requested).await
-    }
-
     pub async fn stop_all(&self) -> Result<()> {
         let targets = {
             let processes = self.processes.read().await;
@@ -804,6 +1030,9 @@ impl Runner {
 
     pub async fn kill_targets(&self, targets: &[String]) -> Result<()> {
         for target in targets {
+            self.set_watch_request(target, false).await;
+            self.set_desired_state_for(target, DesiredState::Stopped)
+                .await;
             self.terminate_target(target).await?;
         }
         Ok(())
@@ -818,8 +1047,6 @@ impl Runner {
         let Some(handle) = handle else {
             return Ok(());
         };
-
-        self.mark_restart_suppressed(target).await;
 
         let pid = {
             let state_guard = self.state.read().await;
@@ -850,10 +1077,6 @@ impl Runner {
             if let Some(entry) = state_guard.targets.get_mut(target) {
                 entry.runtime_watch = false;
                 entry.rufa_watch = false;
-                entry.restart_pending = false;
-                entry.restart_attempt = 0;
-                entry.restart_delay = None;
-                entry.restart_scheduled_for = None;
             }
         }
 

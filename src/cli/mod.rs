@@ -204,3 +204,4 @@ impl From<CompletionShell> for Shell {
 }
 
 mod handlers;
+pub mod log_io;

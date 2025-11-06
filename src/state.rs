@@ -3,7 +3,7 @@
 //! In-memory state tracking for the supervisor.
 
 use std::collections::{HashMap, VecDeque};
-use std::time::{Duration, SystemTime};
+use std::time::SystemTime;
 
 #[derive(Debug, Default, Clone)]
 pub struct RuntimeState {
@@ -28,14 +28,6 @@ pub struct TargetState {
     pub rufa_watch: bool,
     /// Historical run records (most recent first).
     pub history: VecDeque<RunRecord>,
-    /// Backoff attempt count for pending restarts.
-    pub restart_attempt: u32,
-    /// Whether rufa has a restart scheduled for this service.
-    pub restart_pending: bool,
-    /// Amount of delay chosen for the pending restart, if any.
-    pub restart_delay: Option<Duration>,
-    /// When the pending restart is scheduled to kick off.
-    pub restart_scheduled_for: Option<SystemTime>,
 }
 
 #[derive(Debug, Clone)]
@@ -63,10 +55,6 @@ impl Default for TargetState {
             runtime_watch: false,
             rufa_watch: false,
             history: VecDeque::new(),
-            restart_attempt: 0,
-            restart_pending: false,
-            restart_delay: None,
-            restart_scheduled_for: None,
         }
     }
 }
@@ -102,9 +90,5 @@ impl TargetState {
         self.last_exit = None;
         self.runtime_watch = runtime_watch;
         self.rufa_watch = rufa_watch;
-        self.restart_pending = false;
-        self.restart_attempt = 0;
-        self.restart_delay = None;
-        self.restart_scheduled_for = None;
     }
 }

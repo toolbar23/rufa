@@ -19,7 +19,7 @@ use tokio::{
     sync::{Mutex, mpsc},
     task::JoinHandle,
 };
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 use crate::runner::{Runner, WatchSpec};
 
@@ -108,10 +108,15 @@ impl WatchManager {
                             };
 
                             if !targets.is_empty() {
-                                if let Err(error) =
-                                    runner_clone.restart_targets(&targets, false).await
-                                {
-                                    error!(%error, "watch-triggered restart failed");
+                                for target in targets {
+                                    if runner_clone.request_restart_from_watch(&target).await {
+                                        info!(target = %target, "watch-triggered restart queued");
+                                    } else {
+                                        debug!(
+                                            target = %target,
+                                            "watch change ignored (state not eligible)"
+                                        );
+                                    }
                                 }
                             }
                             pending_flag.store(false, Ordering::SeqCst);
