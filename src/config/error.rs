@@ -50,6 +50,8 @@ pub enum ConfigError {
     },
     #[error("unknown refresh watch type '{value}' for target '{target}'")]
     UnknownRefreshWatchType { target: String, value: String },
+    #[error("unknown refresh mode '{value}' in [watch]")]
+    UnknownRefreshMode { value: String },
 }
 
 pub type ConfigResult<T> = Result<T, ConfigError>;

@@ -1,6 +1,5 @@
 use super::log_io;
 use super::*;
-use crate::env::OVERRIDE_ENV_FILE_VAR;
 use crate::ipc::{
     BehaviorKind, InfoRequest, InfoResponse, RefreshCommand, RefreshMode, RefreshWatchTypeKind,
     RestartRequest, RunHistorySummary, RunningTargetSummary, ServerResponse, StartTargetsRequest,
@@ -8,6 +7,7 @@ use crate::ipc::{
     connect_existing_client, require_daemon_client, run_daemon, spawn_daemon_process,
     wait_for_daemon_ready, wait_for_shutdown,
 };
+use crate::{config, env::OVERRIDE_ENV_FILE_VAR};
 use anyhow::Context;
 use std::io::IsTerminal;
 use std::{
@@ -124,7 +124,17 @@ pub async fn start_daemon(args: DaemonStartArgs) -> Result<()> {
         println!("rufa daemon already running; use `rufa stop` to restart it if needed");
         Ok(())
     } else {
-        let spawn_result = spawn_daemon_process(false, env_file_path.as_deref()).await;
+        let refresh_on_change = match config::load_from_path("rufa.toml") {
+            Ok(cfg) => cfg.watch.refresh_on_change,
+            Err(error) => {
+                tracing::warn!(
+                    %error,
+                    "failed to read refresh settings from rufa.toml; defaulting to auto"
+                );
+                true
+            }
+        };
+        let spawn_result = spawn_daemon_process(refresh_on_change, env_file_path.as_deref()).await;
         if let Err(error) = spawn_result {
             return Err(error).context("failed to spawn rufa daemon");
         }

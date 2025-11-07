@@ -35,6 +35,7 @@ pub struct RawEnvConfig {
 #[derive(Debug, Default, Deserialize)]
 pub struct RawWatchConfig {
     pub stability_seconds: Option<u64>,
+    pub refresh_on_change: Option<Value>,
 }
 
 #[derive(Debug, Default, Deserialize)]

@@ -197,9 +197,21 @@ async fn run_daemon_internal() -> Result<()> {
     let listener = UnixListener::bind(&socket_path)
         .with_context(|| format!("binding IPC socket at {:?}", socket_path))?;
 
+    let config_path = PathBuf::from("rufa.toml");
+    let configured_refresh = match config::load_from_path(&config_path) {
+        Ok(cfg) => cfg.watch.refresh_on_change,
+        Err(error) => {
+            tracing::warn!(
+                %error,
+                "failed to read refresh settings from rufa.toml; defaulting to auto"
+            );
+            config::WatchConfig::default().refresh_on_change
+        }
+    };
+
     let refresh_on_change = match std::env::var("RUFA_REFRESH_TARGET_ON_CHANGE") {
         Ok(value) => matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"),
-        Err(_) => false,
+        Err(_) => configured_refresh,
     };
 
     let lock_info = LockInfo {
@@ -217,7 +229,6 @@ async fn run_daemon_internal() -> Result<()> {
         "rufa daemon started"
     );
 
-    let config_path = PathBuf::from("rufa.toml");
     let env_override_path = std::env::var_os(crate::env::OVERRIDE_ENV_FILE_VAR).map(PathBuf::from);
     let watch = Arc::new(WatchManager::new());
     let refresh_on_change_flag = Arc::new(AtomicBool::new(refresh_on_change));

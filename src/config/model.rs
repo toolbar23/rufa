@@ -44,12 +44,14 @@ pub struct EnvConfig {
 #[derive(Debug, Clone)]
 pub struct WatchConfig {
     pub stability: Duration,
+    pub refresh_on_change: bool,
 }
 
 impl Default for WatchConfig {
     fn default() -> Self {
         Self {
             stability: Duration::from_secs(10),
+            refresh_on_change: true,
         }
     }
 }

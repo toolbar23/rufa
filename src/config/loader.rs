@@ -34,7 +34,7 @@ pub fn load_from_str(config_path: &Path, contents: &str) -> ConfigResult<Config>
 fn convert_raw_config(config_path: &Path, raw: RawConfig) -> ConfigResult<Config> {
     let log = convert_log_config(config_path, raw.log);
     let env = convert_env_config(config_path, raw.env);
-    let watch = convert_watch_config(raw.watch);
+    let watch = convert_watch_config(raw.watch)?;
     let run_history = convert_run_history_config(raw.run_history);
     let debug_update = convert_debug_update_config(config_path, raw.debug_update)?;
     let targets = convert_targets(config_path, raw.targets)?;
@@ -81,14 +81,44 @@ fn convert_env_config(config_path: &Path, raw: Option<super::raw::RawEnvConfig>)
     env
 }
 
-fn convert_watch_config(raw: Option<RawWatchConfig>) -> WatchConfig {
+fn convert_watch_config(raw: Option<RawWatchConfig>) -> ConfigResult<WatchConfig> {
     let mut config = WatchConfig::default();
     if let Some(raw_watch) = raw {
         if let Some(seconds) = raw_watch.stability_seconds {
             config.stability = Duration::from_secs(seconds.max(1));
         }
+        if let Some(value) = raw_watch.refresh_on_change {
+            config.refresh_on_change = parse_refresh_on_change_value(value)?;
+        }
     }
-    config
+    Ok(config)
+}
+
+fn parse_refresh_on_change_value(value: toml::Value) -> ConfigResult<bool> {
+    match value {
+        toml::Value::Boolean(enabled) => Ok(enabled),
+        toml::Value::Integer(number) => match number {
+            0 => Ok(false),
+            1 => Ok(true),
+            other => Err(ConfigError::UnknownRefreshMode {
+                value: other.to_string(),
+            }),
+        },
+        toml::Value::String(text) => {
+            let trimmed = text.trim();
+            if trimmed.is_empty() {
+                return Err(ConfigError::UnknownRefreshMode { value: text });
+            }
+            match trimmed.to_ascii_lowercase().as_str() {
+                "auto" | "on" | "true" | "1" | "yes" => Ok(true),
+                "off" | "false" | "0" | "no" => Ok(false),
+                _ => Err(ConfigError::UnknownRefreshMode { value: text }),
+            }
+        }
+        other => Err(ConfigError::UnknownRefreshMode {
+            value: other.to_string(),
+        }),
+    }
 }
 
 fn convert_run_history_config(raw: Option<RawRunHistoryConfig>) -> RunHistoryConfig {
@@ -601,6 +631,7 @@ port.metrics.fixed = 9100
         assert_eq!(config.log.rotation_size_bytes, Some(10 * 1024 * 1024));
         assert_eq!(config.log.keep_history_count, 5);
         assert_eq!(config.watch.stability, Duration::from_secs(10));
+        assert!(config.watch.refresh_on_change);
         let debug_update = config.debug_update.as_ref().expect("debug update");
         assert_eq!(debug_update.prefix, "RUFA");
         assert_eq!(
@@ -692,6 +723,33 @@ port.metrics.fixed = 9100
         let metrics_port = prg2.ports.get("metrics").expect("metrics port");
         assert_eq!(metrics_port.protocol, PortProtocol::Tcp);
         assert_eq!(metrics_port.selection, PortSelection::Fixed(9100));
+    }
+
+    #[test]
+    fn parses_refresh_on_change_setting() {
+        let toml = r#"
+[watch]
+refresh_on_change = "off"
+stability_seconds = 5
+"#;
+
+        let config = load_from_str(fixture_path(), toml).expect("config parsed");
+        assert_eq!(config.watch.stability, Duration::from_secs(5));
+        assert!(!config.watch.refresh_on_change);
+    }
+
+    #[test]
+    fn rejects_unknown_refresh_mode() {
+        let toml = r#"
+[watch]
+refresh_on_change = "later"
+"#;
+
+        let err = load_from_str(fixture_path(), toml).unwrap_err();
+        match err {
+            ConfigError::UnknownRefreshMode { .. } => {}
+            other => panic!("expected UnknownRefreshMode, got {other:?}"),
+        }
     }
 
     #[test]

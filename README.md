@@ -85,7 +85,7 @@ Rufa ships with adapters for these target `type` values:
   * `port.<name>.fixed = PORT` – always use the given port number.
 
 ### Watch Paths
-- Services refresh automatically when files change if refresh-on-change is set to `auto`.
+- Services refresh automatically when files change; the default `rufa.toml` setting is `[watch] refresh_on_change = "auto"`. Set it to `"off"` to boot the daemon with refreshes disabled, or run `rufa refresh set {auto|off}` to toggle at runtime.
 - Add `watch = ["relative/path", "/abs/path"]` to a service target to restrict restarts to specific directories.
 - When omitted, rufa watches the entire workspace.
 - Control who handles refreshes via `refresh_watch_type` (default `RUFA`). Switch to `PREFER_RUNTIME_SUPPLIED` when you want the target driver to run in its own watch mode (for example Bun `--watch`) while rufa coordinates restarts.
@@ -148,7 +148,7 @@ Re-run the command after upgrading rufa so the completions stay current. Command
 2. Start the supervisor with `rufa start` (add `--foreground` if you prefer to stay attached).
 3. Launch the desired targets via `rufa target start ...`.
 4. Use `rufa info` to share runtime details (ports, URLs, debug ports) with the agent.
-5. The agent reads `rufa log` or tails specific targets to validate behavior after each change; enable automatic refreshes by running `rufa refresh set auto`.
+5. The agent reads `rufa log` or tails specific targets to validate behavior after each change; refreshes start in `auto` mode by default, so run `rufa refresh set off` if you need to pause them temporarily.
 6. Use `rufa target stop` to halt individual targets or `rufa stop` when the development session ends to clean up.
 
 ## Notes for Future Enhancements

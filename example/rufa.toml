@@ -14,6 +14,7 @@ read_env_file = ".env"
 
 [watch]
 stability_seconds = 10
+refresh_on_change = "auto"
 
 [target.FRONT_BACK]
 type = "composite"
